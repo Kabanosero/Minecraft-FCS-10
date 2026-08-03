@@ -9,6 +9,10 @@
 -- AUTOBOOT_ROLES / writeStartupFile below.
 --
 -- Usage: installer install <supervisor|plc|hmi|rtu|test>
+--        installer update [supervisor|plc|hmi|rtu|test]
+--        installer status [supervisor|plc|hmi|rtu|test]
+--        installer clear  [supervisor|plc|hmi|rtu|test]
+--        installer start   (interactive GUI menu for all of the above)
 
 local BASE_URL = "https://raw.githubusercontent.com/Kabanosero/Minecraft-FCS-10/main/FCS-10/"
 
@@ -138,6 +142,40 @@ local function writeStartupFile(role, onStatus)
 end
 
 -- ---------------------------------------------------------------------------
+-- Records which role this computer was last installed as, so `installer
+-- update` (see UPDATE section below) can find every file to re-check
+-- without the caller having to type the role again. Plain text, local disk
+-- only, never transmitted - not a secret, just bookkeeping. Failure is
+-- non-fatal: worst case, a future bare `installer update` can't
+-- auto-detect and asks the caller to name the role explicitly.
+-- ---------------------------------------------------------------------------
+local ROLE_MANIFEST_PATH = "/.fcs10-role"
+
+local function writeRoleManifest(role)
+    local file = fs.open(ROLE_MANIFEST_PATH, "w")
+    if not file then
+        return false
+    end
+    file.write(role)
+    file.close()
+    return true
+end
+
+local function readInstalledRole()
+    if not fs.exists(ROLE_MANIFEST_PATH) or fs.isDir(ROLE_MANIFEST_PATH) then
+        return nil
+    end
+    local file = fs.open(ROLE_MANIFEST_PATH, "r")
+    local content = file.readAll()
+    file.close()
+    content = content:gsub("%s+$", "")
+    if ROLE_FILES[content] then
+        return content
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
 -- Downloads every file for `role` (COMMON_FILES + ROLE_FILES[role]) and, for
 -- an auto-boot role, writes /startup.lua once all downloads succeed. Shared
 -- by both the CLI path (`installer install <role>`, onStatus omitted -
@@ -158,6 +196,10 @@ local function installRole(role, onStatus)
         end
     end
 
+    if allOk then
+        writeRoleManifest(role)
+    end
+
     if AUTOBOOT_ROLES[role] then
         if allOk then
             writeStartupFile(role, onStatus)
@@ -173,27 +215,251 @@ local function installRole(role, onStatus)
     return allOk
 end
 
-local function printUsage()
-    print("Usage:")
-    print("  installer start")
-    print("      Launch the click-driven install wizard.")
-    print("  installer install <supervisor|plc|hmi|rtu|test>")
-    print("      Headless install for scripting/automation.")
+-- ===========================================================================
+-- UPDATE (installer update [role]) - re-fetches every file for a role and
+-- overwrites only the ones that actually changed, instead of `install`'s
+-- unconditional overwrite. Lets an already-deployed node check "am I
+-- current?" without blindly re-writing (and re-flashing the filesystem for)
+-- files that are already identical to the repo's main branch.
+-- ===========================================================================
+
+-- Same shape as downloadFile, but compares against the existing local file
+-- first and only writes when the bytes actually differ. onStatus (if given)
+-- is called with one of "active" | "current" | "updated" | "failed" -
+-- "current"/"updated" are new statuses on top of downloadFile's "ok"/
+-- "failed", since a successful check has two distinguishable outcomes here.
+local function checkAndUpdateFile(path, onStatus)
+    if onStatus then
+        onStatus(path, "active")
+    end
+
+    local url = BASE_URL .. path
+    local response, err = http.get(url)
+    if not response then
+        if onStatus then
+            onStatus(path, "failed", tostring(err))
+        else
+            print("[INSTALLER] FAILED: " .. path .. " (" .. tostring(err) .. ")")
+        end
+        return "failed"
+    end
+
+    local remote = response.readAll()
+    response.close()
+
+    local localContents = nil
+    if fs.exists(path) and not fs.isDir(path) then
+        local f = fs.open(path, "r")
+        localContents = f.readAll()
+        f.close()
+    end
+
+    if localContents == remote then
+        if onStatus then
+            onStatus(path, "current")
+        else
+            print("[INSTALLER] CURRENT: " .. path)
+        end
+        return "current"
+    end
+
+    local dir = fs.getDir(path)
+    if dir ~= "" and not fs.exists(dir) then
+        fs.makeDir(dir)
+    end
+
+    local file, ferr = fs.open(path, "w")
+    if not file then
+        if onStatus then
+            onStatus(path, "failed", tostring(ferr))
+        else
+            print("[INSTALLER] FAILED: could not open " .. path .. " for write (" .. tostring(ferr) .. ")")
+        end
+        return "failed"
+    end
+    file.write(remote)
+    file.close()
+
+    if onStatus then
+        onStatus(path, "updated")
+    else
+        print("[INSTALLER] UPDATED: " .. path)
+    end
+    return "updated"
+end
+
+-- Runs checkAndUpdateFile over every file for `role` (COMMON_FILES +
+-- ROLE_FILES[role] - deliberately NOT /startup.lua: its content is just a
+-- fixed dofile() of the role's own entry point, which never goes stale on
+-- its own). Returns a { current = n, updated = n, failed = n } tally.
+local function updateRole(role, onStatus)
+    local files = {}
+    for _, path in ipairs(COMMON_FILES) do
+        files[#files + 1] = path
+    end
+    for _, path in ipairs(ROLE_FILES[role]) do
+        files[#files + 1] = path
+    end
+
+    local counts = { current = 0, updated = 0, failed = 0 }
+    for _, path in ipairs(files) do
+        local status = checkAndUpdateFile(path, onStatus)
+        counts[status] = counts[status] + 1
+    end
+    return counts
+end
+
+-- Read-only counterpart to checkAndUpdateFile - fetches the remote copy and
+-- compares it to the local file, but never writes anything, so "check
+-- status" can never have a side effect. Kept as its own function (some
+-- duplication with checkAndUpdateFile's fetch) rather than sharing a
+-- write-capable helper, so that guarantee holds by construction, not just
+-- by convention. onStatus is called with "active" then one of "current" |
+-- "stale" (local differs from repo) | "missing" (no local copy at all) |
+-- "failed".
+local function checkFileStatus(path, onStatus)
+    if onStatus then
+        onStatus(path, "active")
+    end
+
+    local url = BASE_URL .. path
+    local response, err = http.get(url)
+    if not response then
+        if onStatus then
+            onStatus(path, "failed", tostring(err))
+        else
+            print("[INSTALLER] FAILED: " .. path .. " (" .. tostring(err) .. ")")
+        end
+        return "failed"
+    end
+
+    local remote = response.readAll()
+    response.close()
+
+    local status
+    if not fs.exists(path) or fs.isDir(path) then
+        status = "missing"
+    else
+        local f = fs.open(path, "r")
+        local localContents = f.readAll()
+        f.close()
+        status = (localContents == remote) and "current" or "stale"
+    end
+
+    if onStatus then
+        onStatus(path, status)
+    else
+        print(("[INSTALLER] %s: %s"):format(status:upper(), path))
+    end
+    return status
+end
+
+-- Runs checkFileStatus over every file for `role`. Returns a
+-- { current = n, stale = n, missing = n, failed = n } tally - same file
+-- list as updateRole (COMMON_FILES + ROLE_FILES[role], no /startup.lua).
+local function statusForRole(role, onStatus)
+    local files = {}
+    for _, path in ipairs(COMMON_FILES) do
+        files[#files + 1] = path
+    end
+    for _, path in ipairs(ROLE_FILES[role]) do
+        files[#files + 1] = path
+    end
+
+    local counts = { current = 0, stale = 0, missing = 0, failed = 0 }
+    for _, path in ipairs(files) do
+        local status = checkFileStatus(path, onStatus)
+        counts[status] = counts[status] + 1
+    end
+    return counts
 end
 
 -- ===========================================================================
--- GUI wizard (installer start) - a click-driven role-select -> download ->
--- configure -> reboot flow, reusing nodes/hmi.lua's theme/button pattern.
+-- CLEAR (installer clear <role>) - deletes every file this installer wrote
+-- for `role`: COMMON_FILES, ROLE_FILES[role], /startup.lua (if it was an
+-- auto-boot role), and the role manifest itself - returning this computer
+-- to a blank state. Deliberately never touches /secret.key or
+-- /supervisor.key: those are network/site-wide secrets, not tied to any one
+-- role, so clearing a role must not force re-entering them on the next
+-- install. onStatus mirrors downloadFile's contract: "active" then "ok"
+-- (removed) per file - reuses the same statuses screenDownload already
+-- renders, since "OK" reads just as correctly for "successfully removed"
+-- as it does for "successfully downloaded".
+-- ===========================================================================
+local function clearRole(role, onStatus)
+    local files = {}
+    for _, path in ipairs(COMMON_FILES) do
+        files[#files + 1] = path
+    end
+    for _, path in ipairs(ROLE_FILES[role]) do
+        files[#files + 1] = path
+    end
+    if AUTOBOOT_ROLES[role] then
+        files[#files + 1] = "/startup.lua"
+    end
+
+    local dirsTouched = {}
+    for _, path in ipairs(files) do
+        if onStatus then
+            onStatus(path, "active")
+        end
+        if fs.exists(path) then
+            pcall(fs.delete, path)
+        end
+        local dir = fs.getDir(path)
+        if dir ~= "" then
+            dirsTouched[dir] = true
+        end
+        if onStatus then
+            onStatus(path, "ok")
+        else
+            print("[INSTALLER] REMOVED: " .. path)
+        end
+    end
+
+    -- Cosmetic cleanup: remove now-empty directories this pass touched.
+    -- Never touches a directory that still has other files left in it.
+    for dir in pairs(dirsTouched) do
+        if fs.isDir(dir) and #fs.list(dir) == 0 then
+            pcall(fs.delete, dir)
+        end
+    end
+
+    if fs.exists(ROLE_MANIFEST_PATH) then
+        pcall(fs.delete, ROLE_MANIFEST_PATH)
+    end
+end
+
+local function printUsage()
+    print("Usage:")
+    print("  installer start")
+    print("      Launch the interactive GUI menu (Install/Update/Status/Clear).")
+    print("  installer install <supervisor|plc|hmi|rtu|test>")
+    print("      Headless install for scripting/automation.")
+    print("  installer update [supervisor|plc|hmi|rtu|test]")
+    print("      Check installed files against the repo and update any that")
+    print("      changed. Role can be omitted if this computer was installed")
+    print("      via 'install'/'start' (it's remembered automatically).")
+    print("  installer status [supervisor|plc|hmi|rtu|test]")
+    print("      Same check as 'update', but read-only - never writes.")
+    print("  installer clear [supervisor|plc|hmi|rtu|test]")
+    print("      Remove an installed role's files and /startup.lua from this")
+    print("      computer. Role can be omitted the same way 'update' allows.")
+end
+
+-- ===========================================================================
+-- GUI (installer start) - a persistent main menu (INSTALL/UPDATE/STATUS/
+-- CLEAR/EXIT) built on nodes/hmi.lua's theme/button pattern, where each
+-- menu choice runs its own click-driven sub-flow and then returns to the
+-- menu (see runGui() at the bottom of this section).
 --
--- SEQUENTIAL BLOCKING FLOW, not a unified event loop like hmi.lua: hmi.lua
--- must stay in one loop because it has two concurrent event sources to
--- service for its whole lifetime (mouse_click AND rednet_message - reactor
--- telemetry can arrive at any time). This wizard has no such concurrent
--- responsibility - it's a strictly linear, one-shot sequence where each
--- screen's only event source is its own mouse_click/read() wait, and the
--- next screen never needs to react to something that happened during a
--- previous one. Each screen function draws itself once, blocks until it has
--- a definitive result, and returns that result to runWizard() below.
+-- SEQUENTIAL BLOCKING FLOW within each sub-flow, not a unified event loop
+-- like hmi.lua: hmi.lua must stay in one loop because it has two concurrent
+-- event sources to service for its whole lifetime (mouse_click AND
+-- rednet_message - reactor telemetry can arrive at any time). Nothing here
+-- has that concurrent responsibility - each screen function draws itself
+-- once, blocks until it has a definitive result, and returns that result to
+-- its caller (either another screen or runGui()'s menu loop).
 -- ===========================================================================
 
 local themes = {
@@ -278,9 +544,12 @@ local function drawScreen(w, h, title, subtitle, buttons)
     end
 end
 
--- Restores default shell colors/cursor state. Only needed on the one
--- non-reboot exit path (screenDownload's EXIT button) - os.reboot() wipes
--- all runtime terminal state on every other path, so nothing else needs it.
+-- Restores default shell colors/cursor state. Only needed when actually
+-- leaving the GUI without an os.reboot() (which wipes all runtime terminal
+-- state on its own) - that's just runGui()'s EXIT branch: every other
+-- "back out of a sub-flow" path (e.g. screenDownload's EXIT-after-failure
+-- button) returns to runGui()'s loop instead, which redraws the main menu
+-- via drawScreen()'s own full clear - no separate reset needed there.
 local function resetTerm()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
@@ -289,26 +558,37 @@ local function resetTerm()
     term.setCursorPos(1, 1)
 end
 
-local function screenRoleSelect()
-    local w, h = term.getSize()
-
+-- Lays out `defs` (list of {id, label, colorKey}) as a vertically stacked,
+-- horizontally centered button column sized to fit the terminal - shared by
+-- every screen that's just a simple vertical menu (role-select, main menu).
+-- Mutates and returns `defs` with x/y/width filled in.
+local function layoutButtonColumn(defs, w, h)
     local btnWidth = math.max(10, math.min(w - 4, 24))
     local btnX = math.floor((w - btnWidth) / 2) + 1
     local spacing = 3
-    if 4 + #GUI_ROLES * spacing > h then
-        spacing = math.max(2, math.floor((h - 5) / #GUI_ROLES))
+    if 4 + #defs * spacing > h then
+        spacing = math.max(2, math.floor((h - 5) / #defs))
     end
+    for i, btn in ipairs(defs) do
+        btn.x, btn.y, btn.width = btnX, 3 + i * spacing, btnWidth
+    end
+    return defs
+end
+
+-- title/subtitle default to the original "pick a role to install" wording
+-- so the existing Install flow's call site (no args) is unchanged; the
+-- Update/Clear flows below pass their own wording when they fall back to
+-- this same picker for a computer with no recorded role yet.
+local function screenRoleSelect(title, subtitle)
+    local w, h = term.getSize()
 
     local buttons = {}
     for i, roleDef in ipairs(GUI_ROLES) do
-        buttons[i] = {
-            id = roleDef.id, label = roleDef.label,
-            x = btnX, y = 3 + i * spacing, width = btnWidth,
-            colorKey = "btnNeutral",
-        }
+        buttons[i] = { id = roleDef.id, label = roleDef.label, colorKey = "btnNeutral" }
     end
+    layoutButtonColumn(buttons, w, h)
 
-    drawScreen(w, h, "FCS-10 Installer", "Select node role to install:", buttons)
+    drawScreen(w, h, title or "FCS-10 Installer", subtitle or "Select node role to install:", buttons)
 
     while true do
         local _, button, x, y = os.pullEvent("mouse_click")
@@ -327,7 +607,47 @@ local STATUS_GLYPH = {
     ok      = { text = "OK",   colorKey = "btnSafe"     },
     failed  = { text = "FAIL", colorKey = "btnDanger"   },
     skipped = { text = "SKIP", colorKey = "btnDanger"   },
+    -- Update/Status-only outcomes (checkAndUpdateFile/checkFileStatus):
+    current = { text = "OK",   colorKey = "btnSafe"     }, -- local already matches the repo
+    updated = { text = "NEW",  colorKey = "btnNeutral"  }, -- local was rewritten this run
+    stale   = { text = "OLD",  colorKey = "btnDanger"   }, -- local differs, not yet updated (Status is read-only)
+    missing = { text = "MISS", colorKey = "btnDanger"   }, -- no local copy at all
 }
+
+-- Shared per-file status table renderer, used by screenDownload/
+-- screenUpdate/screenStatus/screenClear - all four show "path ... GLYPH"
+-- rows for a fixed file list, updated live via an onStatus(path, status)
+-- callback (the exact contract downloadFile/checkAndUpdateFile/
+-- checkFileStatus/clearRole already speak). Building the row map and draw
+-- closure once here avoids reimplementing the same layout math four times.
+-- `startRow` (default 2) is the header offset before row 1 - screenStatus
+-- passes 4 to leave room for its own "Installed role: X" subtitle line.
+local function makeStatusTable(files, startRow)
+    startRow = startRow or 2
+    local rowOf = {}
+    for i, path in ipairs(files) do
+        rowOf[path] = i
+    end
+    local w, h = term.getSize()
+    return function(path, status)
+        local row = rowOf[path]
+        if not row or startRow + row > h then
+            return
+        end
+        local glyph = STATUS_GLYPH[status] or STATUS_GLYPH.pending
+        term.setBackgroundColor(currentTheme.bg)
+        term.setCursorPos(2, startRow + row)
+        term.setTextColor(currentTheme.text)
+        local label = path
+        if #label > w - 8 then
+            label = label:sub(1, w - 8)
+        end
+        term.write(label .. string.rep(" ", math.max(0, w - 8 - #label)))
+        term.setCursorPos(w - 5, startRow + row)
+        term.setTextColor(currentTheme[glyph.colorKey] or currentTheme.text)
+        term.write(string.format("%-5s", glyph.text))
+    end
+end
 
 local function screenDownload(role)
     local w, h = term.getSize()
@@ -343,29 +663,7 @@ local function screenDownload(role)
         files[#files + 1] = "/startup.lua"
     end
 
-    local rowOf = {}
-    for i, path in ipairs(files) do
-        rowOf[path] = i
-    end
-
-    local function drawRow(path, status)
-        local row = rowOf[path]
-        if not row or 2 + row > h then
-            return
-        end
-        local glyph = STATUS_GLYPH[status] or STATUS_GLYPH.pending
-        term.setBackgroundColor(currentTheme.bg)
-        term.setCursorPos(2, 2 + row)
-        term.setTextColor(currentTheme.text)
-        local label = path
-        if #label > w - 8 then
-            label = label:sub(1, w - 8)
-        end
-        term.write(label .. string.rep(" ", math.max(0, w - 8 - #label)))
-        term.setCursorPos(w - 5, 2 + row)
-        term.setTextColor(currentTheme[glyph.colorKey] or currentTheme.text)
-        term.write(string.format("%-5s", glyph.text))
-    end
+    local drawRow = makeStatusTable(files)
 
     drawScreen(w, h, "Installing: " .. role:upper(), nil, {})
     for _, path in ipairs(files) do
@@ -479,20 +777,315 @@ local function screenDone(role)
     end
 end
 
-local function runWizard()
+-- Falls back to screenRoleSelect() (with Update-flavored wording) when this
+-- computer has no recorded role yet - same "ask if we can't detect"
+-- philosophy the CLI's resolveCliRole() below uses.
+local function screenUpdate()
+    local w, h = term.getSize()
+    local role = readInstalledRole()
+    if not role then
+        role = screenRoleSelect("Update", "No installed role detected - select one to check:")
+    end
+
+    local files = {}
+    for _, path in ipairs(COMMON_FILES) do
+        files[#files + 1] = path
+    end
+    for _, path in ipairs(ROLE_FILES[role]) do
+        files[#files + 1] = path
+    end
+
+    drawScreen(w, h, "Updating: " .. role:upper(), nil, {})
+    local drawRow = makeStatusTable(files)
+    for _, path in ipairs(files) do
+        drawRow(path, "pending")
+    end
+
+    local counts = updateRole(role, drawRow)
+    writeRoleManifest(role)
+
+    local n = #files
+    term.setBackgroundColor(currentTheme.bg)
+    term.setTextColor(currentTheme.text)
+    term.setCursorPos(2, 4 + n)
+    term.write(("%d current, %d updated, %d failed"):format(counts.current, counts.updated, counts.failed))
+
+    -- Only offer an immediate reboot when something an auto-boot role's
+    -- running code actually changed - never surprise-reboot a live daemon
+    -- (esp. the PLC, controlling a reactor) when nothing needed it.
+    local buttons
+    if counts.updated > 0 and AUTOBOOT_ROLES[role] then
+        buttons = {
+            { id = "reboot", label = "REBOOT NOW", x = 3,  y = 6 + n, width = 14, colorKey = "btnSafe"    },
+            { id = "back",   label = "BACK",        x = 19, y = 6 + n, width = 12, colorKey = "btnNeutral" },
+        }
+    else
+        buttons = {
+            { id = "back", label = "BACK TO MENU", x = 3, y = 6 + n, width = 18, colorKey = "btnNeutral" },
+        }
+    end
+    for _, btn in ipairs(buttons) do
+        drawButton(btn)
+    end
+
+    while true do
+        local _, button, x, y = os.pullEvent("mouse_click")
+        if button == 1 then
+            local btn = hitTest(buttons, x, y)
+            if btn then
+                if btn.id == "reboot" then
+                    term.setCursorPos(2, 8 + n)
+                    term.write("Rebooting...")
+                    os.reboot()
+                else
+                    return
+                end
+            end
+        end
+    end
+end
+
+-- Read-only: never writes, so there is no fallback role-picker here the
+-- way screenUpdate/screenClear have - checking status for a role this
+-- computer was never installed as isn't a meaningful action.
+local function screenStatus()
+    local w, h = term.getSize()
+    local role = readInstalledRole()
+
+    if not role then
+        drawScreen(w, h, "Status", nil, {})
+        term.setCursorPos(2, 3)
+        term.write("No installed role detected on this computer.")
+        local backBtn = { id = "back", label = "BACK", x = 3, y = 6, width = 12, colorKey = "btnNeutral" }
+        drawButton(backBtn)
+        while true do
+            local _, button, x, y = os.pullEvent("mouse_click")
+            if button == 1 and hitTest({ backBtn }, x, y) then
+                return
+            end
+        end
+    end
+
+    local files = {}
+    for _, path in ipairs(COMMON_FILES) do
+        files[#files + 1] = path
+    end
+    for _, path in ipairs(ROLE_FILES[role]) do
+        files[#files + 1] = path
+    end
+
+    drawScreen(w, h, "Status", "Installed role: " .. role:upper(), {})
+    local drawRow = makeStatusTable(files, 4)
+    for _, path in ipairs(files) do
+        drawRow(path, "pending")
+    end
+
+    local counts = statusForRole(role, drawRow)
+
+    local n = #files
+    term.setBackgroundColor(currentTheme.bg)
+    term.setCursorPos(2, 6 + n)
+    if counts.stale > 0 or counts.missing > 0 then
+        term.setTextColor(currentTheme.btnDanger)
+        term.write(("%d stale, %d missing - run Update"):format(counts.stale, counts.missing))
+    elseif counts.failed > 0 then
+        term.setTextColor(currentTheme.btnDanger)
+        term.write(("%d checks failed (network?)"):format(counts.failed))
+    else
+        term.setTextColor(currentTheme.btnSafe)
+        term.write("All files up to date.")
+    end
+    term.setTextColor(currentTheme.text)
+
+    local backBtn = { id = "back", label = "BACK TO MENU", x = 3, y = 8 + n, width = 18, colorKey = "btnNeutral" }
+    drawButton(backBtn)
+    while true do
+        local _, button, x, y = os.pullEvent("mouse_click")
+        if button == 1 and hitTest({ backBtn }, x, y) then
+            return
+        end
+    end
+end
+
+-- The one destructive action in this menu, so it's the only screen with a
+-- CONFIRM/CANCEL step - same "ask before an irreversible action" pattern
+-- RETRY/EXIT already uses for screenDownload's failure path, just with a
+-- real choice to cancel back to the menu instead of just picking a
+-- different way forward.
+local function screenClear()
+    local w, h = term.getSize()
+    local role = readInstalledRole()
+
+    if not role then
+        drawScreen(w, h, "Clear / Uninstall", nil, {})
+        term.setCursorPos(2, 3)
+        term.write("No installed role detected on this computer.")
+        term.setCursorPos(2, 4)
+        term.write("Nothing to clear.")
+        local backBtn = { id = "back", label = "BACK", x = 3, y = 6, width = 12, colorKey = "btnNeutral" }
+        drawButton(backBtn)
+        while true do
+            local _, button, x, y = os.pullEvent("mouse_click")
+            if button == 1 and hitTest({ backBtn }, x, y) then
+                return
+            end
+        end
+    end
+
+    drawScreen(w, h, "Clear / Uninstall", "Installed role: " .. role:upper(), {})
+    term.setCursorPos(2, 5)
+    term.write("This removes " .. role .. "'s script files, /startup.lua,")
+    term.setCursorPos(2, 6)
+    term.write("and the role record from this computer.")
+    term.setCursorPos(2, 8)
+    term.setTextColor(currentTheme.btnSafe)
+    term.write("/secret.key and /supervisor.key are NOT touched.")
+    term.setTextColor(currentTheme.text)
+
+    local confirmBtn = { id = "confirm", label = "CONFIRM CLEAR", x = 3,  y = 11, width = 18, colorKey = "btnDanger"  }
+    local cancelBtn  = { id = "cancel",  label = "CANCEL",        x = 23, y = 11, width = 12, colorKey = "btnNeutral" }
+    drawButton(confirmBtn)
+    drawButton(cancelBtn)
+
+    local choice
+    while not choice do
+        local _, button, x, y = os.pullEvent("mouse_click")
+        if button == 1 then
+            local btn = hitTest({ confirmBtn, cancelBtn }, x, y)
+            if btn then
+                choice = btn.id
+            end
+        end
+    end
+
+    if choice == "cancel" then
+        return
+    end
+
+    local files = {}
+    for _, path in ipairs(COMMON_FILES) do
+        files[#files + 1] = path
+    end
+    for _, path in ipairs(ROLE_FILES[role]) do
+        files[#files + 1] = path
+    end
+    if AUTOBOOT_ROLES[role] then
+        files[#files + 1] = "/startup.lua"
+    end
+
+    drawScreen(w, h, "Clearing: " .. role:upper(), nil, {})
+    local drawRow = makeStatusTable(files)
+    for _, path in ipairs(files) do
+        drawRow(path, "pending")
+    end
+
+    clearRole(role, drawRow)
+
+    local n = #files
+    term.setBackgroundColor(currentTheme.bg)
+    term.setTextColor(currentTheme.btnSafe)
+    term.setCursorPos(2, 4 + n)
+    term.write(role:upper() .. " has been removed from this computer.")
+    term.setTextColor(currentTheme.text)
+
+    local backBtn = { id = "back", label = "BACK TO MENU", x = 3, y = 6 + n, width = 18, colorKey = "btnNeutral" }
+    drawButton(backBtn)
+    while true do
+        local _, button, x, y = os.pullEvent("mouse_click")
+        if button == 1 and hitTest({ backBtn }, x, y) then
+            return
+        end
+    end
+end
+
+-- Persistent entry point (installer start): shows the currently installed
+-- role (if any) as a subtitle, and dispatches each button to its own
+-- self-contained sub-flow - see runGui() below for the loop that keeps
+-- returning here after each one finishes.
+local function screenMainMenu()
+    local w, h = term.getSize()
+    local role = readInstalledRole()
+
+    local buttons = {
+        { id = "install", label = "INSTALL", colorKey = "btnSafe"    },
+        { id = "update",  label = "UPDATE",  colorKey = "btnNeutral" },
+        { id = "status",  label = "STATUS",  colorKey = "btnNeutral" },
+        { id = "clear",   label = "CLEAR",   colorKey = "btnDanger"  },
+        { id = "exit",    label = "EXIT",    colorKey = "btnNeutral" },
+    }
+    layoutButtonColumn(buttons, w, h)
+
+    local subtitle = role and ("Installed role: " .. role:upper()) or "No role installed on this computer yet."
+    drawScreen(w, h, "FCS-10 Installer", subtitle, buttons)
+
+    while true do
+        local _, button, x, y = os.pullEvent("mouse_click")
+        if button == 1 then
+            local btn = hitTest(buttons, x, y)
+            if btn then
+                return btn.id
+            end
+        end
+    end
+end
+
+-- Unchanged linear flow (role-select -> download -> configure -> reboot),
+-- just no longer the GUI's only path - see runGui() below. screenDone()
+-- never returns (it os.reboot()s), so the only way this function returns
+-- normally is the screenDownload "exit" abort path, which falls through to
+-- runGui()'s loop and redraws the main menu again.
+local function runInstall()
     local role = screenRoleSelect()
     local result = screenDownload(role)
     if result == "exit" then
-        resetTerm()
         return
     end
     screenConfig()
     screenDone(role) -- never returns (os.reboot())
 end
 
+local function runGui()
+    while true do
+        local choice = screenMainMenu()
+        if choice == "install" then
+            runInstall()
+        elseif choice == "update" then
+            screenUpdate()
+        elseif choice == "status" then
+            screenStatus()
+        elseif choice == "clear" then
+            screenClear()
+        elseif choice == "exit" then
+            resetTerm()
+            return
+        end
+    end
+end
+
 -- ---------------------------------------------------------------------------
 -- Main
 -- ---------------------------------------------------------------------------
+-- Shared by the update/status/clear CLI branches below: validates an
+-- explicit role if one was given, else falls back to readInstalledRole() -
+-- the same "ask if we can't detect" fallback screenUpdate/screenClear use
+-- in the GUI.
+local function resolveCliRole(explicitRole, actionVerb)
+    if explicitRole then
+        if not ROLE_FILES[explicitRole] then
+            print("[INSTALLER] Unknown role: " .. tostring(explicitRole))
+            return nil
+        end
+        return explicitRole
+    end
+    local detected = readInstalledRole()
+    if not detected then
+        print("[INSTALLER] Could not determine the installed role on this computer.")
+        print("Specify it explicitly, e.g.: installer " .. actionVerb .. " plc")
+        return nil
+    end
+    return detected
+end
+
 local args = { ... }
 local action = args[1]
 local role = args[2]
@@ -500,7 +1093,40 @@ local role = args[2]
 if action == "install" and ROLE_FILES[role] then
     installRole(role)
 elseif action == "start" then
-    runWizard()
+    runGui()
+elseif action == "update" then
+    local targetRole = resolveCliRole(role, "update")
+    if targetRole then
+        print("[INSTALLER] Checking " .. targetRole .. " against the repo...")
+        local counts = updateRole(targetRole)
+        writeRoleManifest(targetRole)
+        print(("[INSTALLER] %d current, %d updated, %d failed"):format(
+            counts.current, counts.updated, counts.failed))
+        if counts.updated > 0 then
+            if AUTOBOOT_ROLES[targetRole] then
+                print("[INSTALLER] Updated - reboot this computer to run the new version.")
+            else
+                print("[INSTALLER] Updated - changes take effect next time this script is run.")
+            end
+        elseif counts.failed == 0 then
+            print("[INSTALLER] Already up to date.")
+        end
+    end
+elseif action == "status" then
+    local targetRole = resolveCliRole(role, "status")
+    if targetRole then
+        print("[INSTALLER] Checking " .. targetRole .. " against the repo (read-only)...")
+        local counts = statusForRole(targetRole)
+        print(("[INSTALLER] %d current, %d stale, %d missing, %d failed"):format(
+            counts.current, counts.stale, counts.missing, counts.failed))
+    end
+elseif action == "clear" then
+    local targetRole = resolveCliRole(role, "clear")
+    if targetRole then
+        print("[INSTALLER] Removing " .. targetRole .. "'s files from this computer...")
+        clearRole(targetRole)
+        print("[INSTALLER] Done. /secret.key and /supervisor.key were left untouched.")
+    end
 else
     printUsage()
 end

@@ -28,11 +28,19 @@
 -- HMAC over the exact bytes it received and only unserializes afterward.
 --
 -- ANTI-REPLAY: keyed on (envelope.ts, envelope.seq) rather than a bare
--- monotonic counter. os.epoch("ingame") is ms since world creation, read
--- identically by every computer in the world and unaffected by a single
--- node rebooting (unlike a local counter, which would reset to 1 and
--- permanently lock that node out once a peer's high-water mark is past
--- it). seq is only a same-millisecond tie-breaker.
+-- monotonic counter. os.epoch("utc") is real wall-clock ms (shared Java
+-- host clock, so every computer in the world reads it identically) and
+-- unaffected by a single node rebooting (unlike a local counter, which
+-- would reset to 1 and permanently lock that node out once a peer's
+-- high-water mark is past it). seq is only a same-millisecond tie-breaker.
+-- Deliberately NOT os.epoch("ingame"): that clock maps a full in-game day
+-- onto a virtual 24h/86400000ms scale, but a Minecraft day is only ~20
+-- real minutes long - so it runs ~72x faster than real time. Every elapsed-
+-- time comparison in this project (HEARTBEAT_TIMEOUT_S, etc.) is written in
+-- real seconds, so "ingame" silently shrinks every timeout by ~72x. Pure
+-- ordering (this replay check) would tolerate that scale, but every other
+-- os.epoch call in the codebase measures a real duration, so "utc" is used
+-- everywhere for one consistent clock.
 --
 -- MODULE CACHING: unlike require(), dofile() re-executes a file's top
 -- level on every call. secnet needs its seq counter / replay cache / secret
@@ -113,7 +121,7 @@ local function buildWireMessage(msgType, payload)
         v       = 1,
         t       = msgType,
         from    = os.getComputerID(),
-        ts      = os.epoch("ingame"),
+        ts      = os.epoch("utc"),
         seq     = mySeq,
         payload = payload,
     }

@@ -40,7 +40,7 @@ end
 local NET = config.NETWORK
 local MSG = config.NETWORK.MSG_TYPE
 
-local TITLE = "FCS-10 Supervisor"
+local TITLE = "FCS-10 HMI"
 local STATUS_TOP = 15  -- first row of the reserved status console (bottom of screen)
 
 -- ===========================================================================
@@ -73,6 +73,8 @@ local themes = {
 }
 
 local currentTheme = themes.classic
+
+local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
 
 -- ===========================================================================
 -- BUTTON REGISTRY
@@ -200,19 +202,47 @@ end
 -- ===========================================================================
 -- MAIN EVENT LOOP
 -- ===========================================================================
-drawUI()
-
 -- secnet.open() handles modem/rednet open AND secret-key loading
 -- internally (see lib/secnet.lua's loadSecret(), sourced from
 -- config.SECURITY.SECRET_FILE with a loud DEV_DEFAULT_SECRET fallback) -
 -- nodes never touch the secret directly, matching plc.lua/supervisor.lua.
 -- Non-fatal like both of those: a failed open leaves the local UI usable,
 -- it just means every sendCommand() broadcast below will fail too.
-local okOpen, openErr = secnet.open(nil, NET.PROTOCOL_HMI)
-if okOpen then
-    logStatus("[HMI] secnet open on " .. NET.PROTOCOL_HMI)
-else
-    logStatus("[HMI] WARNING: secnet.open failed (" .. tostring(openErr) .. ")")
+--
+-- secnet.open()'s only failure mode is "no modem found this call" (see
+-- lib/secnet.lua) - often just a boot-order race, since a modem peripheral
+-- can attach a tick or two after the computer itself starts running. A
+-- single failed attempt at boot must not leave this node permanently unable
+-- to send commands, so tryOpenSecnet() is retried on every "peripheral"
+-- attach event below (same pattern nodes/plc.lua and nodes/supervisor.lua
+-- use).
+local function tryOpenSecnet()
+    if secnetOpen then
+        return true
+    end
+    local ok, err = secnet.open(nil, NET.PROTOCOL_HMI)
+    if ok then
+        secnetOpen = true
+        logStatus("[HMI] secnet open on " .. NET.PROTOCOL_HMI)
+    end
+    return ok, err
+end
+
+-- Called BEFORE drawUI(): loadSecret() prints a raw (non-logStatus) warning
+-- when /secret.key is missing, since lib/secnet.lua is a shared library
+-- with no awareness of any particular node's UI conventions. Every other
+-- node is headless/log-only, where that's fine - but here, calling
+-- secnet.open() first lets any such raw print happen during the plain boot
+-- scroll, before drawUI()'s full term.clear() + redraw wipes it clean.
+-- Calling it after drawUI() (as this file used to) let that raw print land
+-- mid-chrome, tearing up the button grid exactly the way the STATUS
+-- CONSOLE comment above warns about.
+local okOpen, openErr = tryOpenSecnet()
+
+drawUI()
+
+if not okOpen then
+    logStatus("[HMI] WARNING: secnet.open failed (" .. tostring(openErr) .. ") - will keep retrying")
 end
 
 while true do
@@ -237,6 +267,8 @@ while true do
         end
         -- rejections (nil, reason) from secnet.handleEvent are not errors -
         -- ignore and keep the loop running, matching plc.lua/supervisor.lua.
+    elseif event == "peripheral" then
+        tryOpenSecnet() -- a modem attaching this tick is exactly what "peripheral" fires for
     end
 
     -- Future: "timer" branch (periodic redraw/re-broadcast) and full

@@ -133,6 +133,8 @@ local testingMode     = false -- simulated flag, Shift-Supervisor-gated
 local epgActive       = false -- simulated flag, set true on first SCRAM, never reset
 local inRunback       = false -- edge-detection latch for Auto-Runback entry/exit
 
+local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
+
 -- Forward-declared (defined below unbindReactor, which needs to call it)
 -- so it stays a proper local rather than leaking into _G.
 local broadcastTelemetry
@@ -179,6 +181,7 @@ broadcastTelemetry = function()
         peripheralPresent  = peripheralPresent,
         actuationConfirmed = lastScramActuationConfirmed,
         plcId              = os.getComputerID(),
+        role               = "PLC",
         loto               = lotoTag,
         operatingMode      = operatingMode,
         steamBypassOpen    = steamBypassOpen,
@@ -227,6 +230,27 @@ local function tryBindReactor(sideHint)
     end
 end
 
+-- Attempts to open secnet if it hasn't succeeded yet. secnet.open()'s only
+-- failure mode is "no modem found this call" (see lib/secnet.lua), which is
+-- often just a boot-order race - a modem peripheral can attach a tick or
+-- two after the computer itself starts running, so a single attempt at
+-- boot can miss a modem that is physically present and will be found on
+-- the very next retry. No-ops once secnetOpen is true - never re-hosts an
+-- already-open protocol. Called at boot, opportunistically every poll tick,
+-- and on every "peripheral" attach event (same belt-and-suspenders pattern
+-- tryBindReactor uses for the reactor).
+local function tryOpenSecnet()
+    if secnetOpen then
+        return true
+    end
+    local ok, err = secnet.open(nil, NET.PROTOCOL_PLC)
+    if ok then
+        secnetOpen = true
+        print("[PLC] secnet opened")
+    end
+    return ok, err
+end
+
 -- ===========================================================================
 -- doScram - one shared, latched, idempotent trip function
 -- ===========================================================================
@@ -248,8 +272,20 @@ local function doScram(reason)
     if hadReactor then
         local ok1, err1 = pcall(reactor.setBurnRate, 0)
         local ok2, err2 = pcall(reactor.scram)
-        burnOk, scramOk = ok1, ok2
-        if not (ok1 and ok2) then
+
+        -- Mekanism throws "Scram requires the reactor to be active" when the
+        -- reactor is already inactive (not producing) - that is not a
+        -- hardware failure, it's the reactor already sitting at SCRAM's
+        -- target state (tripped/not running). Treating it as an actuation
+        -- failure would incorrectly unbind a perfectly healthy peripheral
+        -- every time the fail-safe watchdog fires against an idle reactor
+        -- (e.g. during Cold Start/Bypass with burn rate 0) - count it as a
+        -- successful trip instead.
+        local alreadyInactive = not ok2 and type(err2) == "string"
+            and err2:find("requires the reactor to be active", 1, true) ~= nil
+
+        burnOk, scramOk = ok1, ok2 or alreadyInactive
+        if not (ok1 and scramOk) then
             unbindReactor("actuation failure during SCRAM: " .. tostring(err1 or err2))
         end
     end
@@ -284,7 +320,7 @@ local function doScram(reason)
         },
         actuationConfirmed = lastScramActuationConfirmed,
         plcId = os.getComputerID(),
-        ts    = os.epoch("ingame"),
+        ts    = os.epoch("utc"),
     })
 end
 
@@ -318,7 +354,7 @@ local function pollAndEvaluate()
             end
 
             reactorState.online     = true
-            reactorState.lastUpdate = os.epoch("ingame")
+            reactorState.lastUpdate = os.epoch("utc")
             reactorState.seq        = reactorState.seq + 1
 
             -- Latched: once SCRAMMED, never re-evaluate thresholds again
@@ -391,6 +427,8 @@ local function pollAndEvaluate()
     else
         tryBindReactor(nil) -- opportunistic retry; peripheral event handles the common case
     end
+
+    tryOpenSecnet() -- opportunistic retry; peripheral event handles the common case (see tryOpenSecnet)
 
     local ok, err = broadcastTelemetry()
     if not ok then
@@ -514,7 +552,7 @@ local function handleCommand(fromId, payload)
         -- Single-tag-slot model (v1 simplification - see file header):
         -- re-applying while already tagged overwrites reason/timestamp/
         -- appliedBy, it does not stack.
-        lotoTag = { reason = payload.reason, appliedAt = os.epoch("ingame"), appliedBy = fromId }
+        lotoTag = { reason = payload.reason, appliedAt = os.epoch("utc"), appliedBy = fromId }
         print(("[PLC] LOTO TAG APPLIED by #%d: %s"):format(fromId, payload.reason))
         broadcastTelemetry() -- immediate out-of-cycle update, same pattern as unbindReactor()
 
@@ -595,9 +633,9 @@ local function main()
         print("[PLC] WARNING: no " .. REACTOR_TYPE .. " found at startup - LPS running in hardware-absent mode")
     end
 
-    local okOpen, openErr = secnet.open(nil, NET.PROTOCOL_PLC)
+    local okOpen, openErr = tryOpenSecnet()
     if not okOpen then
-        print("[PLC] WARNING: secnet.open failed (" .. tostring(openErr) .. ") - local LPS protection remains fully active")
+        print("[PLC] WARNING: secnet.open failed (" .. tostring(openErr) .. ") - local LPS protection remains fully active; will keep retrying as peripherals attach")
     end
 
     pollAndEvaluate() -- immediate first pass, don't wait a full cadence before the first LPS check
@@ -645,6 +683,7 @@ local function main()
                 -- errors - ignore and keep the loop running.
             elseif event == "peripheral" then
                 tryBindReactor(p1)
+                tryOpenSecnet() -- a modem attaching this tick is exactly what "peripheral" fires for
             elseif event == "peripheral_detach" then
                 if p1 == reactorSide then
                     unbindReactor("peripheral_detach on side " .. tostring(p1))

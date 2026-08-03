@@ -113,6 +113,7 @@ local function unbindReactor(reason)
         state             = rtuState,
         peripheralPresent = peripheralPresent,
         rtuId             = os.getComputerID(),
+        role              = "RTU",
     })
 end
 
@@ -190,7 +191,7 @@ local function pollAndPublish()
 
             rtuState.online     = true
             rtuState.plantState = STATES.NORMAL -- hardware-presence flag only; never latched (see header)
-            rtuState.lastUpdate = os.epoch("ingame")
+            rtuState.lastUpdate = os.epoch("utc")
             rtuState.seq        = rtuState.seq + 1
         end
     else
@@ -201,6 +202,7 @@ local function pollAndPublish()
         state             = rtuState,
         peripheralPresent = peripheralPresent,
         rtuId             = os.getComputerID(),
+        role              = "RTU",
     })
     if not ok then
         print("[RTU] telemetry broadcast failed: " .. tostring(err))

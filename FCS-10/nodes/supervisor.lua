@@ -20,14 +20,23 @@
 -- Getting this backwards would silently mean PLCs never see the heartbeat
 -- that is supposed to stop them fail-safe SCRAMming.
 --
--- SCOPE: this draft is read-only monitoring plus a callable command
--- interface (sendBurnRateCommand/sendScramCommand) - there is no
--- keyboard-driven command menu wired into the terminal loop here.
--- Interactive operator control is a future HMI node's job. Note also that
--- because CC:Tweaked runs each program in its own environment, these two
--- functions are reachable from other code only if that code lives in (or
--- is pulled into) THIS running script - not from a separate concurrent
--- shell/REPL process on the same computer.
+-- SCOPE: mostly read-only monitoring, plus a click-only command interface
+-- (SCRAM / OPEN BYPASS / CLOSE BYPASS buttons, on whichever PLC row is
+-- clicked first) and a fuller callable command interface
+-- (sendBurnRateCommand/sendApplyTagCommand/etc, all the way up to
+-- sendExitTestingCommand) reachable from a REPL pulled into this running
+-- script. The buttons are deliberately click-only, never a typed-input
+-- prompt: this file must never block longer than a single os.pullEvent()
+-- wait (see above), and a blocking read() for a burn-rate value/LOTO
+-- reason/Shift Supervisor key could pause this loop past
+-- HEARTBEAT_TIMEOUT_S, which would make every PLC's own watchdog assume
+-- this node is dead and fail-safe SCRAM the whole fleet. Commands needing
+-- typed input stay on test/cmd_test.lua for now - a proper non-blocking
+-- on-screen keyboard is a real future feature, not attempted here. Note
+-- also that because CC:Tweaked runs each program in its own environment,
+-- the callable functions are reachable from other code only if that code
+-- lives in (or is pulled into) THIS running script - not from a separate
+-- concurrent shell/REPL process on the same computer.
 --
 -- EAL MAPPING: config.EAL.IC only names keys for damage (all three tiers),
 -- coolant (LOSS_OF_COOLANT), and SCRAM_FAILURE. There is no dedicated key
@@ -89,6 +98,43 @@ local OPERATING_MODE_ABBR = {
 -- the EAL decision - see computeEAL()).
 local TREND_EPS = { damagePct = 0.1, coreTempK = 1, coolantPct = 0.5, wastePct = 0.5 }
 
+-- Theme/button pattern ported from nodes/hmi.lua (and installer.lua's GUI
+-- wizard, which already duplicated it the same way) - kept local to each
+-- file rather than factored into a shared module, consistent with how this
+-- codebase has handled it so far. Click-only actions for now (SCRAM/bypass
+-- open/close): commands needing typed input (burn rate, LOTO reason, Shift
+-- Supervisor key) stay on test/cmd_test.lua, since this file must never
+-- block longer than a single os.pullEvent() wait (see file header) - a
+-- blocking read() prompt here for more than HEARTBEAT_TIMEOUT_S would cause
+-- every PLC's own watchdog to assume this node is dead and fail-safe SCRAM
+-- the whole fleet.
+local currentTheme = {
+    btnSafe    = colors.green,
+    btnDanger  = colors.red,
+    btnNeutral = colors.lightBlue,
+    text       = colors.white,
+}
+
+local function drawButton(btn, selected)
+    term.setBackgroundColor(selected and colors.white or currentTheme[btn.colorKey])
+    term.setTextColor(selected and colors.black or colors.white)
+    term.setCursorPos(btn.x, btn.y)
+    term.write(string.rep(" ", btn.width))
+    term.setCursorPos(btn.x + math.floor((btn.width - #btn.label) / 2), btn.y)
+    term.write(btn.label)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+end
+
+local function hitTestButtons(buttons, x, y)
+    for _, btn in ipairs(buttons) do
+        if y == btn.y and x >= btn.x and x < btn.x + btn.width then
+            return btn
+        end
+    end
+    return nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Module state
 -- ---------------------------------------------------------------------------
@@ -100,6 +146,38 @@ local lastHeartbeatSentAt  = 0
 local lastCommandRef       = nil -- most recent pend (pending or resolved), for the header line
 local lastScramGlobal      = nil -- most recent SCRAM across all PLCs, for the header line
 
+local selectedPlcId        = nil -- clicked PLC row, target of the click-only action buttons below
+-- Captured at the end of each redraw() so the mouse_click handler can map a
+-- click's (x,y) back to a plcId / button without duplicating the sort and
+-- layout logic that produced them.
+local lastRenderedRows      = {}
+local lastRenderedTableTop  = nil
+local lastRenderedButtons   = {}
+
+local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
+
+-- secnet.open()'s only failure mode is "no modem found this call" (see
+-- lib/secnet.lua) - often just a boot-order race, since a modem peripheral
+-- can attach a tick or two after the computer itself starts running. A
+-- single failed attempt at boot must not leave this node permanently deaf:
+-- every PLC's own watchdog fail-safe SCRAMs on the assumption a live
+-- Supervisor would otherwise be heartbeating it, so a Supervisor stuck deaf
+-- forever is the worst version of this bug in the whole project. Retried
+-- opportunistically every TELEMETRY_INTERVAL_S tick and on every
+-- "peripheral" attach event (same belt-and-suspenders pattern
+-- nodes/plc.lua's tryBindReactor/tryOpenSecnet use for the reactor/modem).
+local function tryOpenSecnet()
+    if secnetOpen then
+        return true
+    end
+    local ok, err = secnet.open(nil, NET.PROTOCOL_SUPERVISOR)
+    if ok then
+        secnetOpen = true
+        print("[SUP] secnet opened")
+    end
+    return ok, err
+end
+
 -- ---------------------------------------------------------------------------
 -- Per-PLC record lifecycle
 -- ---------------------------------------------------------------------------
@@ -108,7 +186,7 @@ local function touchPlc(plcId)
     if not rec then
         rec = {
             id                 = plcId,
-            firstSeenTs        = os.epoch("ingame"),
+            firstSeenTs        = os.epoch("utc"),
             lastSeenTs         = 0,
             lastTelemetryTs    = 0, -- 0 == "never" -- drives online/offline (see isOnline)
             state              = config.newDefaultReactorState(),
@@ -123,10 +201,11 @@ local function touchPlc(plcId)
             steamBypassOpen    = nil,
             testingMode        = nil,
             epgActive          = nil,
+            role               = nil, -- "PLC" | "RTU" | nil (genuinely unknown until first TELEMETRY confirms it)
         }
         plcs[plcId] = rec
     end
-    rec.lastSeenTs = os.epoch("ingame")
+    rec.lastSeenTs = os.epoch("utc")
     return rec
 end
 
@@ -135,7 +214,7 @@ end
 -- packet. lastTelemetryTs starts at 0, so a PLC that has said hello via
 -- HEARTBEAT but never sent TELEMETRY correctly reads as offline.
 local function isOnline(rec)
-    return (os.epoch("ingame") - rec.lastTelemetryTs) < (NET.HEARTBEAT_TIMEOUT_S * 1000)
+    return (os.epoch("utc") - rec.lastTelemetryTs) < (NET.HEARTBEAT_TIMEOUT_S * 1000)
 end
 
 -- ---------------------------------------------------------------------------
@@ -226,13 +305,14 @@ local function onTelemetry(plcId, payload)
     rec.state              = payload.state
     rec.peripheralPresent  = payload.peripheralPresent
     rec.actuationConfirmed = payload.actuationConfirmed
-    rec.lastTelemetryTs    = os.epoch("ingame")
+    rec.lastTelemetryTs    = os.epoch("utc")
     rec.activeEAL          = computeEAL(rec)
 
     rec.loto            = payload.loto
     rec.steamBypassOpen = payload.steamBypassOpen
     rec.testingMode     = payload.testingMode
     rec.epgActive       = payload.epgActive
+    rec.role            = payload.role
 
     if payload.operatingMode and payload.operatingMode ~= rec.operatingMode then
         print(("[SUP] PLC #%d -> %s: %s"):format(
@@ -251,7 +331,7 @@ local function onScram(plcId, payload)
         metrics            = payload.metrics,
         actuationConfirmed = payload.actuationConfirmed,
         ts                 = payload.ts,
-        receivedAt         = os.epoch("ingame"),
+        receivedAt         = os.epoch("utc"),
         plcId              = plcId,
     }
     rec.activeEAL  = computeEAL(rec)
@@ -276,7 +356,7 @@ local function onAck(plcId, payload)
 
     pend.status      = payload.accepted and "acked" or "rejected"
     pend.reason      = payload.reason
-    pend.roundTripMs = os.epoch("ingame") - pend.firstSentAt
+    pend.roundTripMs = os.epoch("utc") - pend.firstSentAt
 
     print(("[SUP] ACK for command #%d (PLC #%d): %s%s"):format(
         payload.requestId, plcId,
@@ -315,7 +395,7 @@ local function dispatchCommand(plcId, payload)
         payload     = payload,
         attempt     = 1,
         timerId     = timerId,
-        firstSentAt = os.epoch("ingame"),
+        firstSentAt = os.epoch("utc"),
         status      = "pending",
     }
     pendingCommands[payload.requestId] = pend
@@ -543,16 +623,24 @@ local function plcBucket(rec)
     return "WARNING" -- catches ANOMALY and any active EAL tier
 end
 
+-- RTU records are excluded from the worst-bucket computation: an RTU has no
+-- trip/protective authority (see nodes/rtu.lua's header), so its own
+-- hardware-absent/anomaly state shouldn't drive the SYSTEM banner - that's
+-- what PLCs are for. Tracks `foundPlc` rather than reusing next(plcs)==nil
+-- so "AWAITING PLC" is also shown correctly when only RTUs are connected.
 local function aggregateStatus()
-    if next(plcs) == nil then
-        return "AWAITING PLC"
-    end
-    local worst = "NORMAL"
+    local worst, foundPlc = "NORMAL", false
     for _, rec in pairs(plcs) do
-        local bucket = plcBucket(rec)
-        if BUCKET_RANK[bucket] > BUCKET_RANK[worst] then
-            worst = bucket
+        if rec.role ~= "RTU" then
+            foundPlc = true
+            local bucket = plcBucket(rec)
+            if BUCKET_RANK[bucket] > BUCKET_RANK[worst] then
+                worst = bucket
+            end
         end
+    end
+    if not foundPlc then
+        return "AWAITING PLC"
     end
     return worst
 end
@@ -615,11 +703,16 @@ local function redraw()
     term.setCursorPos(1, 1)
     term.write(("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()))
 
+    -- RTU records are excluded from the "(N PLCs, N offline)" header tally
+    -- - that count is specifically about the protected reactor fleet, not
+    -- supplementary monitoring points (see aggregateStatus() above).
     local plcCount, offlineCount, lotoCount = 0, 0, 0
     for _, rec in pairs(plcs) do
-        plcCount = plcCount + 1
-        if not isOnline(rec) then
-            offlineCount = offlineCount + 1
+        if rec.role ~= "RTU" then
+            plcCount = plcCount + 1
+            if not isOnline(rec) then
+                offlineCount = offlineCount + 1
+            end
         end
         if rec.loto then
             lotoCount = lotoCount + 1
@@ -637,7 +730,7 @@ local function redraw()
     term.setTextColor(colors.white)
 
     term.setCursorPos(1, 3)
-    term.write(("HB TX: %s ago (%ds cadence)"):format(fmtAge(os.epoch("ingame") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S))
+    term.write(("HB TX: %s ago (%ds cadence)"):format(fmtAge(os.epoch("utc") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S))
 
     term.setCursorPos(1, 4)
     term.write("CMD: " .. formatCommandStatus(lastCommandRef))
@@ -647,7 +740,7 @@ local function redraw()
         local scramPlc = plcs[lastScramGlobal.plcId]
         local epgNote = (scramPlc and scramPlc.epgActive) and " (EPG ACTIVE)" or ""
         term.write(("LAST SCRAM: #%d %s ago - %s (%s)%s"):format(
-            lastScramGlobal.plcId, fmtAge(os.epoch("ingame") - lastScramGlobal.receivedAt),
+            lastScramGlobal.plcId, fmtAge(os.epoch("utc") - lastScramGlobal.receivedAt),
             tostring(lastScramGlobal.reason),
             lastScramGlobal.actuationConfirmed and "CONFIRMED" or "UNCONFIRMED",
             epgNote))
@@ -664,8 +757,25 @@ local function redraw()
         term.write("LOTO: none active")
     end
 
+    -- Click-only action buttons, bottom-anchored to `h` so they're always
+    -- in the same place regardless of table content/height (independent of
+    -- the tableTop-relative region below). Act on `selectedPlcId` - see
+    -- main()'s mouse_click handler. Drawn before the table's own
+    -- narrow-terminal guard below so they still show even if the table
+    -- itself doesn't fit.
+    local buttons = {
+        { id = "scram",        label = "SCRAM",        x = 1,  y = h, width = 10, colorKey = "btnDanger"  },
+        { id = "open_bypass",  label = "OPEN BYPASS",  x = 12, y = h, width = 14, colorKey = "btnSafe"    },
+        { id = "close_bypass", label = "CLOSE BYPASS", x = 27, y = h, width = 15, colorKey = "btnNeutral" },
+    }
+    for _, btn in ipairs(buttons) do
+        drawButton(btn, false)
+    end
+    lastRenderedButtons = buttons
+
     local tableTop = 8
     if h < tableTop then
+        lastRenderedRows = {}
         return -- terminal too short to show the PLC table at all
     end
     -- "ID  " (4 chars, matches "#%-3d") + 2 glyph columns (LOTO "L", Testing
@@ -694,8 +804,13 @@ local function redraw()
         return a < b
     end)
 
-    local maxRows = math.max(0, h - tableTop - 1) -- leave 1 line for a possible footer
+    -- Leave 2 lines free below the table: 1 for a possible "+N more"
+    -- footer, 1 for the button row pinned to `h` above.
+    local maxRows = math.max(0, h - tableTop - 2)
     local shown = math.min(#rows, maxRows)
+
+    lastRenderedRows = {}
+    lastRenderedTableTop = tableTop
 
     for i = 1, shown do
         local plcId = rows[i]
@@ -703,9 +818,22 @@ local function redraw()
         local s, prev = rec.state, rec.prevState
         local online = isOnline(rec)
 
+        lastRenderedRows[i] = plcId
+
         term.setCursorPos(1, tableTop + i)
-        term.setTextColor(online and colors.white or colors.orange)
-        term.write(string.format("#%-3d", plcId))
+        if plcId == selectedPlcId then
+            -- Selection highlight: inverted colors on the ID cell only,
+            -- so the operator can see the current click-target at a glance.
+            term.setBackgroundColor(colors.white)
+            term.setTextColor(colors.black)
+        else
+            term.setTextColor(online and colors.white or colors.orange)
+        end
+        -- "R" prefix instead of "#" for an RTU row - zero extra width, but
+        -- immediately visible so an RTU is never mistaken for a real,
+        -- protected PLC (see aggregateStatus()/plcCount above).
+        term.write(string.format("%s%-3d", rec.role == "RTU" and "R" or "#", plcId))
+        term.setBackgroundColor(colors.black)
 
         -- LOTO / Testing glyphs: last-known value shown regardless of
         -- `online`, same as every other data column (stale-but-last-known
@@ -740,7 +868,7 @@ local function redraw()
         term.write(string.format("%4.0f ", s.burnRateMbT or 0))
 
         if online then
-            term.write(fmtAge(os.epoch("ingame") - rec.lastTelemetryTs))
+            term.write(fmtAge(os.epoch("utc") - rec.lastTelemetryTs))
         else
             term.setTextColor(colors.orange)
             term.write("OFFLINE")
@@ -775,9 +903,9 @@ end
 local function main()
     print("[SUP] FCS-10 Supervisor booting on computer #" .. os.getComputerID())
 
-    local okOpen, openErr = secnet.open(nil, NET.PROTOCOL_SUPERVISOR)
+    local okOpen, openErr = tryOpenSecnet()
     if not okOpen then
-        print("[SUP] WARNING: secnet.open failed (" .. tostring(openErr) .. ")")
+        print("[SUP] WARNING: secnet.open failed (" .. tostring(openErr) .. ") - will keep retrying as peripherals attach")
     end
 
     safeRedraw() -- immediate first paint, don't wait a full cadence
@@ -786,22 +914,27 @@ local function main()
     local uiTimerId = os.startTimer(NET.TELEMETRY_INTERVAL_S)
 
     while true do
-        local event, p1, p2 = os.pullEvent() -- yields every iteration; never a busy-spin
+        -- 4 values captured (not 3, like plc.lua's loop): mouse_click's
+        -- y-coordinate is p3, needed for the button/row hit-testing below.
+        local event, p1, p2, p3 = os.pullEvent() -- yields every iteration; never a busy-spin
 
         local ok, err = pcall(function()
             if event == "timer" then
                 if p1 == hbTimerId then
                     secnet.broadcast(NET.PROTOCOL_PLC, MSG.HEARTBEAT, {}) -- audience's protocol, not PROTOCOL_SUPERVISOR
-                    lastHeartbeatSentAt = os.epoch("ingame")
+                    lastHeartbeatSentAt = os.epoch("utc")
                     hbTimerId = os.startTimer(NET.HEARTBEAT_INTERVAL_S)
                     safeRedraw()
                 elseif p1 == uiTimerId then
+                    tryOpenSecnet() -- opportunistic retry; peripheral event handles the common case
                     safeRedraw()
                     uiTimerId = os.startTimer(NET.TELEMETRY_INTERVAL_S)
                 else
                     onCommandTimer(p1)
                     safeRedraw()
                 end
+            elseif event == "peripheral" then
+                tryOpenSecnet() -- a modem attaching this tick is exactly what "peripheral" fires for
             elseif event == "rednet_message" then
                 local fromId, msgType, payload = secnet.handleEvent(p1, p2)
                 if fromId then
@@ -821,6 +954,25 @@ local function main()
                 end
                 -- rejections (nil, reason) from secnet.handleEvent are not
                 -- errors - ignore and keep the loop running.
+            elseif event == "mouse_click" then
+                local button, x, y = p1, p2, p3
+                if button == 1 then -- left-click only, same guard installer.lua's wizard uses for consequential actions
+                    local btn = hitTestButtons(lastRenderedButtons, x, y)
+                    if btn then
+                        if selectedPlcId then
+                            if btn.id == "scram" then
+                                sendScramCommand(selectedPlcId)
+                            elseif btn.id == "open_bypass" then
+                                sendOpenBypassCommand(selectedPlcId)
+                            elseif btn.id == "close_bypass" then
+                                sendCloseBypassCommand(selectedPlcId)
+                            end
+                        end
+                    elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
+                        selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
+                    end
+                    safeRedraw()
+                end
             end
         end)
 
