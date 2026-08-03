@@ -44,6 +44,40 @@
 -- specifically the Supervisor" - so COMMAND is accepted from any
 -- authenticated sender. That is a conscious, already-documented v1
 -- limitation, not something this file attempts to fix.
+--
+-- LOTO (LOCKOUT/TAGOUT) PHILOSOPHY (IAEA SSG-76 aligned, v1 simplification):
+-- Mekanism's fission reactor is one monolithic peripheral - no valves or
+-- sub-components exist to tag individually - so a tag applies to the whole
+-- PLC/reactor, the only real isolation point this hardware model has. This
+-- is also a single-tag-slot model, not a multi-lock stack: see lotoTag
+-- below and the COMMAND contract doc-comment for exact idempotency
+-- behavior. Gated by the Shift Supervisor key (see lib/rbac.lua) - a
+-- SEPARATE secret from the network HMAC secret above, carrying the same
+-- conscious "proves role, not individual identity" limitation that secret
+-- already has for node identity. A tag NEVER blocks SCRAM (doScram() is
+-- completely untouched by LOTO) but DOES unconditionally block
+-- SET_BURN_RATE while active, even for a Shift Supervisor re-supplying the
+-- key - the tag must be explicitly removed first, no bypass.
+--
+-- OPERATING MODES: a plant-lifecycle phase (Cold Start/Bypass, Run-Up, Hot
+-- Standby, Normal Operation, Auto-Runback), orthogonal to reactorState's
+-- plantState (which is safety/alarm status, not lifecycle phase) - derived
+-- automatically each poll from burn rate and core temperature, never from
+-- a human declaration. "Hot Standby" here (not actively producing power,
+-- but core still above the ~200F Hot/Cold boundary) and real Tech-Spec-
+-- style "Hot Shutdown" definitions describe the same physical condition;
+-- this file uses the operator-facing "Hot Standby" name. Auto-Runback is a
+-- genuinely new protective automation: an automated, one-time burn-rate
+-- reduction on a HIGH_ALARM-tier fault, short of a full SCRAM - it bypasses
+-- LOTO entirely (a protective power reduction must never be blocked by an
+-- administrative tag, same reasoning as SCRAM bypassing LOTO) and does not
+-- auto-restore burn rate afterward (an operator must deliberately ramp
+-- back up). Steam bypass / testing mode / EPG are simulated-only flags (no
+-- real Mekanism turbine/generator/speaker peripheral exists in this
+-- project) - opening/closing the steam bypass is an Operator-tier "non-
+-- critical valve" action (no RBAC gate); entering/exiting Testing mode
+-- requires the Shift Supervisor key, matching real plant practice for
+-- authorizing a safety-test regime.
 
 local REACTOR_TYPE = "fissionReactorLogicAdapter"
 
@@ -65,6 +99,19 @@ if not okSn then
     return
 end
 
+-- rbac (Shift Supervisor key check) load is intentionally NON-FATAL, unlike
+-- config/secnet above: SCRAM and the LPS trip logic must never depend on
+-- it. If it fails to load, `rbac` stays nil and checkSupervisorGate() below
+-- fails CLOSED on every SET_BURN_RATE/APPLY_TAG/REMOVE_TAG/ENTER_TESTING/
+-- EXIT_TESTING (reason "rbac-unavailable") until fixed - a controls gate
+-- that's down should refuse controls, not silently allow them.
+local okRbac, rbacModule = pcall(dofile, "/lib/rbac.lua")
+local rbac = okRbac and rbacModule or nil
+if not okRbac then
+    print("[PLC] WARNING: failed to load /lib/rbac.lua: " .. tostring(rbacModule) ..
+          " - SET_BURN_RATE/APPLY_TAG/REMOVE_TAG/ENTER_TESTING/EXIT_TESTING will be rejected until fixed")
+end
+
 local NET    = config.NETWORK
 local MSG    = config.NETWORK.MSG_TYPE
 local SP     = config.SETPOINTS
@@ -78,6 +125,17 @@ local reactorSide         = nil    -- side/name reactor was wrapped from, for de
 local peripheralPresent   = false  -- true only while `reactor` is a live, working handle
 local reactorState        = config.newDefaultReactorState() -- reused SSOT shape, mutated in place
 local lastScramActuationConfirmed = nil -- nil until the first SCRAM ever fires
+
+local lotoTag         = nil -- nil = untagged; else { reason, appliedAt, appliedBy }
+local operatingMode   = config.OPERATING_MODES.COLD_START_BYPASS -- see header "OPERATING MODES"
+local steamBypassOpen = true  -- simulated valve, Operator-tier (no RBAC gate)
+local testingMode     = false -- simulated flag, Shift-Supervisor-gated
+local epgActive       = false -- simulated flag, set true on first SCRAM, never reset
+local inRunback       = false -- edge-detection latch for Auto-Runback entry/exit
+
+-- Forward-declared (defined below unbindReactor, which needs to call it)
+-- so it stays a proper local rather than leaking into _G.
+local broadcastTelemetry
 
 -- ===========================================================================
 -- Peripheral loss / reacquisition
@@ -106,11 +164,26 @@ local function unbindReactor(reason)
     -- Immediate out-of-cycle broadcast (in addition to the regular 1s
     -- cadence) so the Supervisor learns about hardware loss as fast as
     -- possible rather than waiting for the next scheduled tick.
-    secnet.broadcast(NET.PROTOCOL_SUPERVISOR, MSG.TELEMETRY, {
+    broadcastTelemetry()
+end
+
+-- Shared TELEMETRY broadcast, used by every call site that needs an
+-- immediate out-of-cycle update (this function, doScram-adjacent LOTO/mode
+-- changes below) as well as pollAndEvaluate's regular per-tick broadcast.
+-- lotoTag/operatingMode/steamBypassOpen/testingMode/epgActive are all
+-- orthogonal to reactorState (see header) so they ride alongside it here
+-- rather than being folded into the shared SSOT state shape.
+broadcastTelemetry = function()
+    return secnet.broadcast(NET.PROTOCOL_SUPERVISOR, MSG.TELEMETRY, {
         state              = reactorState,
         peripheralPresent  = peripheralPresent,
         actuationConfirmed = lastScramActuationConfirmed,
         plcId              = os.getComputerID(),
+        loto               = lotoTag,
+        operatingMode      = operatingMode,
+        steamBypassOpen    = steamBypassOpen,
+        testingMode        = testingMode,
+        epgActive          = epgActive,
     })
 end
 
@@ -190,6 +263,11 @@ local function doScram(reason)
     lastScramActuationConfirmed = hadReactor and burnOk and scramOk
     reactorState.burnRateMbT = 0
 
+    -- Simulated flag only (no real Mekanism generator/redstone peripheral
+    -- integration exists in this project - see header). Never reset, same
+    -- as SCRAM itself has no reset mechanism yet either.
+    epgActive = true
+
     print(("[PLC] SCRAM (%s): %s"):format(
         lastScramActuationConfirmed and "actuation confirmed" or "**ACTUATION UNCONFIRMED**",
         reason))
@@ -263,17 +341,58 @@ local function pollAndEvaluate()
                     reactorState.plantState = STATES.NORMAL
                 end
             end
+
+            -- Auto-Runback + Operating Mode derivation - only meaningful
+            -- while not SCRAMMED (a latched trip freezes operatingMode at
+            -- its last value, same "don't recompute past a trip"
+            -- philosophy as the block above; doScram() above may have just
+            -- fired this same tick, hence re-checking plantState here).
+            if reactorState.plantState ~= STATES.SCRAMMED then
+                local highAlarm = reactorState.damagePct >= SP.DAMAGE.HIGH_ALARM
+                    or reactorState.coreTempK >= SP.CORE_TEMP_K.HIGH_ALARM
+                    or reactorState.coolantPct <= SP.COOLANT_PCT.LOW_ALARM
+                    or reactorState.wastePct >= SP.WASTE_PCT.HIGH_ALARM
+                local recovered = reactorState.damagePct < SP.DAMAGE.WARNING
+                    and reactorState.coreTempK < SP.CORE_TEMP_K.WARNING
+                    and reactorState.coolantPct > SP.COOLANT_PCT.LOW_WARNING
+                    and reactorState.wastePct < SP.WASTE_PCT.HIGH_WARNING
+
+                -- Edge-triggered: reduce burn rate ONCE on entry, not every
+                -- tick spent in alarm (that would exponentially decay it).
+                -- Hysteresis on exit (must drop below WARNING, not just
+                -- below HIGH_ALARM) avoids flapping right at the boundary.
+                if highAlarm and not inRunback then
+                    inRunback = true
+                    if reactor and reactorState.burnRateMbT > 0 then
+                        local newRate = reactorState.burnRateMbT * SP.RUNBACK.REDUCTION_FACTOR
+                        local okRunback = pcall(reactor.setBurnRate, newRate)
+                        if okRunback then
+                            print(("[PLC] AUTO-RUNBACK: burn rate reduced to %.1f mB/t"):format(newRate))
+                        end
+                    end
+                elseif inRunback and recovered then
+                    inRunback = false
+                    print("[PLC] AUTO-RUNBACK cleared - conditions recovered")
+                end
+
+                if inRunback then
+                    operatingMode = config.OPERATING_MODES.AUTO_RUNBACK
+                elseif reactorState.burnRateMbT > 0 then
+                    operatingMode = config.OPERATING_MODES.NORMAL_OPERATION
+                elseif reactorState.coreTempK > SP.CORE_TEMP_K.HOT_COLD_BOUNDARY then
+                    operatingMode = config.OPERATING_MODES.HOT_STANDBY
+                elseif steamBypassOpen then
+                    operatingMode = config.OPERATING_MODES.COLD_START_BYPASS
+                else
+                    operatingMode = config.OPERATING_MODES.RUN_UP
+                end
+            end
         end
     else
         tryBindReactor(nil) -- opportunistic retry; peripheral event handles the common case
     end
 
-    local ok, err = secnet.broadcast(NET.PROTOCOL_SUPERVISOR, MSG.TELEMETRY, {
-        state              = reactorState,
-        peripheralPresent  = peripheralPresent,
-        actuationConfirmed = lastScramActuationConfirmed,
-        plcId              = os.getComputerID(),
-    })
+    local ok, err = broadcastTelemetry()
     if not ok then
         print("[PLC] telemetry broadcast failed: " .. tostring(err))
     end
@@ -282,17 +401,29 @@ end
 -- ===========================================================================
 -- COMMAND handling
 -- ===========================================================================
--- Inbound COMMAND payload contract (established here - /nodes/supervisor.lua
--- does not exist yet and must match this):
---   { action = "SET_BURN_RATE" | "SCRAM",
---     value  = <number, mB/t, required for SET_BURN_RATE>,
---     requestId = <optional, echoed back verbatim> }
+-- Inbound COMMAND payload contract (established here - nodes/supervisor.lua
+-- and test/cmd_test.lua both must match this):
+--   { action = "SET_BURN_RATE" | "SCRAM" | "APPLY_TAG" | "REMOVE_TAG" |
+--              "OPEN_STEAM_BYPASS" | "CLOSE_STEAM_BYPASS" |
+--              "ENTER_TESTING" | "EXIT_TESTING",
+--     value         = <number, mB/t, required for SET_BURN_RATE>,
+--     supervisorKey = <string, required for SET_BURN_RATE/APPLY_TAG/
+--                      REMOVE_TAG/ENTER_TESTING/EXIT_TESTING - checked
+--                      against lib/rbac.lua's Shift Supervisor key, a
+--                      SEPARATE secret from the network HMAC secret>,
+--     reason        = <string, required non-empty for APPLY_TAG>,
+--     requestId     = <optional, echoed back verbatim> }
 -- Outbound ACK (sent back to the commander, tagged PROTOCOL_SUPERVISOR):
 --   { action = <echoed>, accepted = true|false,
 --     reason = <only when accepted==false>: "invalid-value" |
 --       "no-reactor-hardware" | "reactor-scrammed" | "actuation-failed" |
+--       "unauthorized-role" | "equipment-tagged-out" | "rbac-unavailable" |
 --       "unknown-action" | "malformed-command",
 --     requestId = <echoed> }
+-- LOTO / Operating Modes: see file header for full philosophy. SCRAM and
+-- the steam bypass toggle are ungated (Operator-tier); SET_BURN_RATE/
+-- APPLY_TAG/REMOVE_TAG/ENTER_TESTING/EXIT_TESTING all require the Shift
+-- Supervisor key.
 -- Future extension point: a "RESET"/"CLEAR_SCRAM" action to un-latch a
 -- trip is intentionally NOT implemented in this draft (see file header).
 local function sendAck(fromId, action, accepted, reason, requestId)
@@ -302,6 +433,21 @@ local function sendAck(fromId, action, accepted, reason, requestId)
         reason    = reason,
         requestId = requestId,
     })
+end
+
+-- Shared gate for the five Shift-Supervisor-key-gated actions
+-- (SET_BURN_RATE, APPLY_TAG, REMOVE_TAG, ENTER_TESTING, EXIT_TESTING). On
+-- false it has already sent the rejecting ACK itself - callers just return.
+local function checkSupervisorGate(fromId, action, payload, requestId)
+    if not rbac then
+        sendAck(fromId, action, false, "rbac-unavailable", requestId)
+        return false
+    end
+    if not rbac.checkSupervisorKey(payload.supervisorKey) then
+        sendAck(fromId, action, false, "unauthorized-role", requestId)
+        return false
+    end
+    return true
 end
 
 local function handleCommand(fromId, payload)
@@ -325,6 +471,16 @@ local function handleCommand(fromId, payload)
             sendAck(fromId, action, false, "invalid-value", requestId)
             return
         end
+        if not checkSupervisorGate(fromId, action, payload, requestId) then
+            return
+        end
+        if lotoTag then
+            -- Reactivity cannot be commanded on tagged-out equipment, even
+            -- by a Shift Supervisor re-supplying the key - the tag must be
+            -- explicitly removed first (see file header).
+            sendAck(fromId, action, false, "equipment-tagged-out", requestId)
+            return
+        end
         if reactorState.plantState == STATES.SCRAMMED then
             -- Burn rate cannot be commanded out of a latched trip.
             sendAck(fromId, action, false, "reactor-scrammed", requestId)
@@ -342,6 +498,82 @@ local function handleCommand(fromId, payload)
             return
         end
 
+        sendAck(fromId, action, true, nil, requestId)
+        return
+    end
+
+    if action == "APPLY_TAG" then
+        if type(payload.reason) ~= "string" or payload.reason == "" then
+            sendAck(fromId, action, false, "invalid-value", requestId)
+            return
+        end
+        if not checkSupervisorGate(fromId, action, payload, requestId) then
+            return
+        end
+
+        -- Single-tag-slot model (v1 simplification - see file header):
+        -- re-applying while already tagged overwrites reason/timestamp/
+        -- appliedBy, it does not stack.
+        lotoTag = { reason = payload.reason, appliedAt = os.epoch("ingame"), appliedBy = fromId }
+        print(("[PLC] LOTO TAG APPLIED by #%d: %s"):format(fromId, payload.reason))
+        broadcastTelemetry() -- immediate out-of-cycle update, same pattern as unbindReactor()
+
+        sendAck(fromId, action, true, nil, requestId)
+        return
+    end
+
+    if action == "REMOVE_TAG" then
+        if not checkSupervisorGate(fromId, action, payload, requestId) then
+            return
+        end
+
+        -- Idempotent-success on an already-untagged reactor - mirrors
+        -- doScram()'s idempotent-latch philosophy: the requested end-state
+        -- (untagged) is already true.
+        lotoTag = nil
+        print(("[PLC] LOTO TAG REMOVED by #%d"):format(fromId))
+        broadcastTelemetry()
+
+        sendAck(fromId, action, true, nil, requestId)
+        return
+    end
+
+    if action == "OPEN_STEAM_BYPASS" then
+        -- Operator-tier "non-critical valve" - no RBAC gate, no interlocks
+        -- (deliberately simple: this is a simulated valve, see header).
+        steamBypassOpen = true
+        print(("[PLC] Steam bypass OPENED via COMMAND from #%d"):format(fromId))
+        broadcastTelemetry()
+        sendAck(fromId, action, true, nil, requestId)
+        return
+    end
+
+    if action == "CLOSE_STEAM_BYPASS" then
+        steamBypassOpen = false
+        print(("[PLC] Steam bypass CLOSED via COMMAND from #%d"):format(fromId))
+        broadcastTelemetry()
+        sendAck(fromId, action, true, nil, requestId)
+        return
+    end
+
+    if action == "ENTER_TESTING" then
+        if not checkSupervisorGate(fromId, action, payload, requestId) then
+            return
+        end
+        testingMode = true
+        print(("[PLC] TESTING MODE ENTERED by #%d"):format(fromId))
+        broadcastTelemetry()
+        sendAck(fromId, action, true, nil, requestId)
+        return
+    end
+
+    if action == "EXIT_TESTING" then
+        if not checkSupervisorGate(fromId, action, payload, requestId) then
+            return
+        end
+        testingMode = false
+        print(("[PLC] TESTING MODE EXITED by #%d"):format(fromId))
+        broadcastTelemetry()
         sendAck(fromId, action, true, nil, requestId)
         return
     end

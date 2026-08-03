@@ -72,6 +72,18 @@ local STATUS_COLOR = {
     DISCONNECTED     = colors.orange,
 }
 
+-- Short display abbreviations for config.OPERATING_MODES, fit to the
+-- table's 10-char STATE field - shown in place of the literal "NORMAL"
+-- text when plantState is NORMAL (ANOMALY/SCRAMMED keep their own display,
+-- see redraw()'s per-row loop).
+local OPERATING_MODE_ABBR = {
+    COLD_START_BYPASS = "CLD-START",
+    RUN_UP            = "RUN-UP",
+    HOT_STANDBY       = "HOT-STDBY",
+    NORMAL_OPERATION  = "NORMAL",
+    AUTO_RUNBACK      = "RUNBACK",
+}
+
 -- Epsilon per metric below which a sample-to-sample change is treated as
 -- noise rather than a real trend, for the UI-only trend glyph (never feeds
 -- the EAL decision - see computeEAL()).
@@ -106,6 +118,11 @@ local function touchPlc(plcId)
             activeEAL          = nil, -- Supervisor-computed; a PLC's own copy of this field is always nil
             lastScram          = nil,
             lastCommand        = nil,
+            loto               = nil, -- mirrors most recent TELEMETRY's `loto` field; nil = untagged
+            operatingMode      = nil,
+            steamBypassOpen    = nil,
+            testingMode        = nil,
+            epgActive          = nil,
         }
         plcs[plcId] = rec
     end
@@ -188,6 +205,18 @@ end
 -- Inbound message handling (called only after secnet.handleEvent has
 -- already verified the packet - see main())
 -- ---------------------------------------------------------------------------
+-- Short reference reminder printed to the console (the "control room") on
+-- an operating-mode transition - the "Checklists on Main Monitor"
+-- requirement, realized as a control-room log line rather than a real
+-- Monitor peripheral (none exists anywhere in this project).
+local OPERATING_MODE_CHECKLIST = {
+    COLD_START_BYPASS = "Verify steam bypass OPEN before startup.",
+    RUN_UP            = "Confirm bypass CLOSED, monitor temp rise during run-up.",
+    HOT_STANDBY       = "Hold at minimal limits - verify coolant/fuel margins before power ascension.",
+    NORMAL_OPERATION  = "At power - burn rate may be adjusted per procedure.",
+    AUTO_RUNBACK      = "Automatic runback in progress - investigate triggering condition before restoring power.",
+}
+
 local function onTelemetry(plcId, payload)
     if type(payload) ~= "table" or type(payload.state) ~= "table" then
         return
@@ -199,6 +228,17 @@ local function onTelemetry(plcId, payload)
     rec.actuationConfirmed = payload.actuationConfirmed
     rec.lastTelemetryTs    = os.epoch("ingame")
     rec.activeEAL          = computeEAL(rec)
+
+    rec.loto            = payload.loto
+    rec.steamBypassOpen = payload.steamBypassOpen
+    rec.testingMode     = payload.testingMode
+    rec.epgActive       = payload.epgActive
+
+    if payload.operatingMode and payload.operatingMode ~= rec.operatingMode then
+        print(("[SUP] PLC #%d -> %s: %s"):format(
+            plcId, tostring(payload.operatingMode), OPERATING_MODE_CHECKLIST[payload.operatingMode] or ""))
+    end
+    rec.operatingMode = payload.operatingMode
 end
 
 local function onScram(plcId, payload)
@@ -249,7 +289,18 @@ end
 -- ---------------------------------------------------------------------------
 -- COMMAND contract this Supervisor produces (established by plc.lua, which
 -- already ships consuming exactly this shape):
---   { action = "SET_BURN_RATE" | "SCRAM", value = <required for SET_BURN_RATE>, requestId }
+--   { action = "SET_BURN_RATE" | "SCRAM" | "APPLY_TAG" | "REMOVE_TAG" |
+--              "OPEN_STEAM_BYPASS" | "CLOSE_STEAM_BYPASS" |
+--              "ENTER_TESTING" | "EXIT_TESTING",
+--     value         = <required for SET_BURN_RATE>,
+--     reason        = <required for APPLY_TAG>,
+--     supervisorKey = <required for SET_BURN_RATE/APPLY_TAG/REMOVE_TAG/
+--                      ENTER_TESTING/EXIT_TESTING - validated for
+--                      presence only here; this node has no
+--                      /supervisor.key and cannot verify correctness, only
+--                      relay whatever the human supplied. Only plc.lua
+--                      (via lib/rbac.lua) is the enforcement point>,
+--     requestId }
 local function nextRequestId()
     nextRequestIdCounter = nextRequestIdCounter + 1
     return nextRequestIdCounter
@@ -284,7 +335,7 @@ end
 
 -- Global on purpose (see file header scope note) - the intended public
 -- interface for issuing operator commands from within this script.
-function sendBurnRateCommand(plcId, targetRate)
+function sendBurnRateCommand(plcId, targetRate, supervisorKey)
     local ok, result = pcall(function()
         if type(plcId) ~= "number" then
             error("invalid-plcId", 0)
@@ -292,10 +343,14 @@ function sendBurnRateCommand(plcId, targetRate)
         if type(targetRate) ~= "number" or targetRate < 0 then
             error("invalid-value", 0)
         end
+        if type(supervisorKey) ~= "string" or supervisorKey == "" then
+            error("invalid-supervisor-key", 0)
+        end
         return dispatchCommand(plcId, {
-            action    = "SET_BURN_RATE",
-            value     = targetRate,
-            requestId = nextRequestId(),
+            action        = "SET_BURN_RATE",
+            value         = targetRate,
+            supervisorKey = supervisorKey,
+            requestId     = nextRequestId(),
         })
     end)
     if not ok then
@@ -312,6 +367,122 @@ function sendScramCommand(plcId)
         return dispatchCommand(plcId, {
             action    = "SCRAM",
             requestId = nextRequestId(),
+        })
+    end)
+    if not ok then
+        return false, result
+    end
+    return true, result
+end
+
+function sendApplyTagCommand(plcId, reason, supervisorKey)
+    local ok, result = pcall(function()
+        if type(plcId) ~= "number" then
+            error("invalid-plcId", 0)
+        end
+        if type(reason) ~= "string" or reason == "" then
+            error("invalid-value", 0)
+        end
+        if type(supervisorKey) ~= "string" or supervisorKey == "" then
+            error("invalid-supervisor-key", 0)
+        end
+        return dispatchCommand(plcId, {
+            action        = "APPLY_TAG",
+            reason        = reason,
+            supervisorKey = supervisorKey,
+            requestId     = nextRequestId(),
+        })
+    end)
+    if not ok then
+        return false, result
+    end
+    return true, result
+end
+
+function sendRemoveTagCommand(plcId, supervisorKey)
+    local ok, result = pcall(function()
+        if type(plcId) ~= "number" then
+            error("invalid-plcId", 0)
+        end
+        if type(supervisorKey) ~= "string" or supervisorKey == "" then
+            error("invalid-supervisor-key", 0)
+        end
+        return dispatchCommand(plcId, {
+            action        = "REMOVE_TAG",
+            supervisorKey = supervisorKey,
+            requestId     = nextRequestId(),
+        })
+    end)
+    if not ok then
+        return false, result
+    end
+    return true, result
+end
+
+function sendOpenBypassCommand(plcId)
+    local ok, result = pcall(function()
+        if type(plcId) ~= "number" then
+            error("invalid-plcId", 0)
+        end
+        return dispatchCommand(plcId, {
+            action    = "OPEN_STEAM_BYPASS",
+            requestId = nextRequestId(),
+        })
+    end)
+    if not ok then
+        return false, result
+    end
+    return true, result
+end
+
+function sendCloseBypassCommand(plcId)
+    local ok, result = pcall(function()
+        if type(plcId) ~= "number" then
+            error("invalid-plcId", 0)
+        end
+        return dispatchCommand(plcId, {
+            action    = "CLOSE_STEAM_BYPASS",
+            requestId = nextRequestId(),
+        })
+    end)
+    if not ok then
+        return false, result
+    end
+    return true, result
+end
+
+function sendEnterTestingCommand(plcId, supervisorKey)
+    local ok, result = pcall(function()
+        if type(plcId) ~= "number" then
+            error("invalid-plcId", 0)
+        end
+        if type(supervisorKey) ~= "string" or supervisorKey == "" then
+            error("invalid-supervisor-key", 0)
+        end
+        return dispatchCommand(plcId, {
+            action        = "ENTER_TESTING",
+            supervisorKey = supervisorKey,
+            requestId     = nextRequestId(),
+        })
+    end)
+    if not ok then
+        return false, result
+    end
+    return true, result
+end
+
+function sendExitTestingCommand(plcId, supervisorKey)
+    local ok, result = pcall(function()
+        if type(plcId) ~= "number" then
+            error("invalid-plcId", 0)
+        end
+        if type(supervisorKey) ~= "string" or supervisorKey == "" then
+            error("invalid-supervisor-key", 0)
+        end
+        return dispatchCommand(plcId, {
+            action        = "EXIT_TESTING",
+            supervisorKey = supervisorKey,
+            requestId     = nextRequestId(),
         })
     end)
     if not ok then
@@ -444,11 +615,14 @@ local function redraw()
     term.setCursorPos(1, 1)
     term.write(("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()))
 
-    local plcCount, offlineCount = 0, 0
+    local plcCount, offlineCount, lotoCount = 0, 0, 0
     for _, rec in pairs(plcs) do
         plcCount = plcCount + 1
         if not isOnline(rec) then
             offlineCount = offlineCount + 1
+        end
+        if rec.loto then
+            lotoCount = lotoCount + 1
         end
     end
 
@@ -470,20 +644,35 @@ local function redraw()
 
     term.setCursorPos(1, 5)
     if lastScramGlobal then
-        term.write(("LAST SCRAM: #%d %s ago - %s (%s)"):format(
+        local scramPlc = plcs[lastScramGlobal.plcId]
+        local epgNote = (scramPlc and scramPlc.epgActive) and " (EPG ACTIVE)" or ""
+        term.write(("LAST SCRAM: #%d %s ago - %s (%s)%s"):format(
             lastScramGlobal.plcId, fmtAge(os.epoch("ingame") - lastScramGlobal.receivedAt),
             tostring(lastScramGlobal.reason),
-            lastScramGlobal.actuationConfirmed and "CONFIRMED" or "UNCONFIRMED"))
+            lastScramGlobal.actuationConfirmed and "CONFIRMED" or "UNCONFIRMED",
+            epgNote))
     else
         term.write("LAST SCRAM: none yet")
     end
 
-    local tableTop = 7
+    term.setCursorPos(1, 6)
+    if lotoCount > 0 then
+        term.setTextColor(colors.red)
+        term.write(("LOTO: %d reactor%s tagged"):format(lotoCount, lotoCount == 1 and "" or "s"))
+        term.setTextColor(colors.white)
+    else
+        term.write("LOTO: none active")
+    end
+
+    local tableTop = 8
     if h < tableTop then
         return -- terminal too short to show the PLC table at all
     end
+    -- "ID  " (4 chars, matches "#%-3d") + 2 glyph columns (LOTO "L", Testing
+    -- "T", 1 char each) + "STATE" (10 chars, matches "%-10s") = 16 chars
+    -- before EAL, matching the per-row writes below exactly.
     term.setCursorPos(1, tableTop)
-    term.write("ID  STATE     EAL  DMG%   T-K   CLT%  WST%  BURN  AGE")
+    term.write("ID    STATE     EAL  DMG%   T-K   CLT%  WST%  BURN  AGE")
 
     -- Sort worst-first so that on a truncated screen the PLCs most worth
     -- an operator's attention are always the ones still visible.
@@ -518,6 +707,14 @@ local function redraw()
         term.setTextColor(online and colors.white or colors.orange)
         term.write(string.format("#%-3d", plcId))
 
+        -- LOTO / Testing glyphs: last-known value shown regardless of
+        -- `online`, same as every other data column (stale-but-last-known
+        -- beats blank while offline, per this project's stated philosophy).
+        term.setTextColor(colors.red)
+        term.write(rec.loto and "L" or " ")
+        term.setTextColor(colors.yellow)
+        term.write(rec.testingMode and "T" or " ")
+
         if s.plantState == STATES.SCRAMMED then
             term.setTextColor(colors.red)
         elseif s.plantState == STATES.ANOMALY then
@@ -525,7 +722,11 @@ local function redraw()
         else
             term.setTextColor(online and colors.white or colors.orange)
         end
-        term.write(string.format("%-10s", tostring(s.plantState or "?")))
+        local stateText = s.plantState
+        if s.plantState == STATES.NORMAL and rec.operatingMode then
+            stateText = OPERATING_MODE_ABBR[rec.operatingMode] or s.plantState
+        end
+        term.write(string.format("%-10s", tostring(stateText or "?")))
 
         local ealColor = rec.activeEAL and TIER_BY_ID[rec.activeEAL] and colors[TIER_BY_ID[rec.activeEAL].color]
         term.setTextColor(ealColor or (online and colors.white or colors.orange))

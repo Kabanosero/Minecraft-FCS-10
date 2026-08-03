@@ -11,6 +11,10 @@
 -- environment) - this tool plays the Supervisor's role for one command at
 -- a time, driven by a human at the keyboard, so the COMMAND/ACK exchange
 -- can be tested directly against a running plc.lua.
+--
+-- Also covers RBAC/LOTO/Operating-Mode actions (APPLY_TAG/REMOVE_TAG,
+-- OPEN/CLOSE_STEAM_BYPASS, ENTER/EXIT_TESTING) - see nodes/plc.lua's
+-- COMMAND contract doc-comment for the full action/payload reference.
 
 local okCfg, config = pcall(dofile, "/lib/config.lua")
 if not okCfg then
@@ -81,6 +85,14 @@ local function promptNumber(label)
     return tonumber(line)
 end
 
+-- Masked input for the Shift Supervisor key, via CC:Tweaked's global
+-- read("*") - unlike promptLine's plain io.read(), this doesn't echo the
+-- typed characters back to the terminal.
+local function promptSecret(label)
+    io.write(label)
+    return read("*")
+end
+
 local function sendCommand(plcId, payload)
     print(("[TEST] sending %s (requestId=%d) to #%d..."):format(payload.action, payload.requestId, plcId))
     local ok, err = secnet.send(plcId, NET.PROTOCOL_PLC, MSG.COMMAND, payload)
@@ -120,7 +132,91 @@ local function runSetBurnRate()
         print("[TEST] invalid burn rate")
         return
     end
-    sendCommand(plcId, { action = "SET_BURN_RATE", value = rate, requestId = nextRequestId() })
+    local supervisorKey = promptSecret("Shift Supervisor key: ")
+    if type(supervisorKey) ~= "string" or supervisorKey == "" then
+        print("[TEST] invalid supervisor key")
+        return
+    end
+    sendCommand(plcId, { action = "SET_BURN_RATE", value = rate, supervisorKey = supervisorKey, requestId = nextRequestId() })
+end
+
+local function runApplyTag()
+    local plcId = promptNumber("Target PLC ID: ")
+    if type(plcId) ~= "number" then
+        print("[TEST] invalid PLC id")
+        return
+    end
+    local reason = promptLine("LOTO reason: ")
+    if type(reason) ~= "string" or reason == "" then
+        print("[TEST] invalid reason")
+        return
+    end
+    local supervisorKey = promptSecret("Shift Supervisor key: ")
+    if type(supervisorKey) ~= "string" or supervisorKey == "" then
+        print("[TEST] invalid supervisor key")
+        return
+    end
+    sendCommand(plcId, { action = "APPLY_TAG", reason = reason, supervisorKey = supervisorKey, requestId = nextRequestId() })
+end
+
+local function runRemoveTag()
+    local plcId = promptNumber("Target PLC ID: ")
+    if type(plcId) ~= "number" then
+        print("[TEST] invalid PLC id")
+        return
+    end
+    local supervisorKey = promptSecret("Shift Supervisor key: ")
+    if type(supervisorKey) ~= "string" or supervisorKey == "" then
+        print("[TEST] invalid supervisor key")
+        return
+    end
+    sendCommand(plcId, { action = "REMOVE_TAG", supervisorKey = supervisorKey, requestId = nextRequestId() })
+end
+
+local function runOpenBypass()
+    local plcId = promptNumber("Target PLC ID: ")
+    if type(plcId) ~= "number" then
+        print("[TEST] invalid PLC id")
+        return
+    end
+    sendCommand(plcId, { action = "OPEN_STEAM_BYPASS", requestId = nextRequestId() })
+end
+
+local function runCloseBypass()
+    local plcId = promptNumber("Target PLC ID: ")
+    if type(plcId) ~= "number" then
+        print("[TEST] invalid PLC id")
+        return
+    end
+    sendCommand(plcId, { action = "CLOSE_STEAM_BYPASS", requestId = nextRequestId() })
+end
+
+local function runEnterTesting()
+    local plcId = promptNumber("Target PLC ID: ")
+    if type(plcId) ~= "number" then
+        print("[TEST] invalid PLC id")
+        return
+    end
+    local supervisorKey = promptSecret("Shift Supervisor key: ")
+    if type(supervisorKey) ~= "string" or supervisorKey == "" then
+        print("[TEST] invalid supervisor key")
+        return
+    end
+    sendCommand(plcId, { action = "ENTER_TESTING", supervisorKey = supervisorKey, requestId = nextRequestId() })
+end
+
+local function runExitTesting()
+    local plcId = promptNumber("Target PLC ID: ")
+    if type(plcId) ~= "number" then
+        print("[TEST] invalid PLC id")
+        return
+    end
+    local supervisorKey = promptSecret("Shift Supervisor key: ")
+    if type(supervisorKey) ~= "string" or supervisorKey == "" then
+        print("[TEST] invalid supervisor key")
+        return
+    end
+    sendCommand(plcId, { action = "EXIT_TESTING", supervisorKey = supervisorKey, requestId = nextRequestId() })
 end
 
 print("FCS-10 command test tool.")
@@ -128,6 +224,12 @@ while true do
     print("")
     print("1) SCRAM")
     print("2) SET_BURN_RATE")
+    print("3) APPLY TAG (LOTO)")
+    print("4) REMOVE TAG (LOTO)")
+    print("5) OPEN STEAM BYPASS")
+    print("6) CLOSE STEAM BYPASS")
+    print("7) ENTER TESTING MODE")
+    print("8) EXIT TESTING MODE")
     print("q) quit")
     local choice = promptLine("> ")
 
@@ -137,6 +239,18 @@ while true do
         runScram()
     elseif choice == "2" then
         runSetBurnRate()
+    elseif choice == "3" then
+        runApplyTag()
+    elseif choice == "4" then
+        runRemoveTag()
+    elseif choice == "5" then
+        runOpenBypass()
+    elseif choice == "6" then
+        runCloseBypass()
+    elseif choice == "7" then
+        runEnterTesting()
+    elseif choice == "8" then
+        runExitTesting()
     else
         print("[TEST] unrecognized option")
     end

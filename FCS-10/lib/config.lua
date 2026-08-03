@@ -69,6 +69,19 @@ config.SECURITY = {
     -- written to its local drive before leaving the dev world.
     DEV_DEFAULT_SECRET = "FCS10-DEV-PLACEHOLDER-CHANGE-ME",
 
+    -- Shift Supervisor role-authorization key (RBAC / LOTO gate) - a
+    -- SEPARATE secret from SECRET_FILE above, for a separate purpose: this
+    -- proves "whoever typed this command holds the Shift Supervisor role,"
+    -- not "this packet came from a trusted node" (that's still SECRET_FILE's
+    -- job, checked first, at the transport layer, before a COMMAND handler
+    -- ever runs). See lib/rbac.lua. Only nodes/plc.lua ever loads/checks
+    -- this; never transmitted except as a plaintext field inside an
+    -- already-HMAC-authenticated COMMAND payload.
+    SUPERVISOR_KEY_FILE = "/supervisor.key",
+
+    -- Placeholder only, same caveat as DEV_DEFAULT_SECRET above.
+    DEV_DEFAULT_SUPERVISOR_KEY = "FCS10-SUPERVISOR-DEV-PLACEHOLDER-CHANGE-ME",
+
     -- Reserved for a future sliding-window replay cache if out-of-order
     -- delivery via rednet repeaters turns out to be an issue in practice.
     -- v1 anti-replay is strict-monotonic sequence numbers per sender.
@@ -94,6 +107,12 @@ config.SETPOINTS = {
         WARNING    = 1000,
         HIGH_ALARM = 1100,
         SCRAM      = 1200,
+
+        -- Hot/Cold Shutdown boundary (~200F), per real PWR Tech-Spec-style
+        -- mode tables: not producing power AND above this temp = Hot
+        -- Standby (still hot, holding); at/below it = Cold Start/Bypass.
+        -- See nodes/plc.lua's Operating Mode derivation.
+        HOT_COLD_BOUNDARY = 366,
     },
 
     COOLANT_PCT = {
@@ -112,6 +131,13 @@ config.SETPOINTS = {
         -- fraction of the reactor's configured max burn rate; sustained
         -- over-rate is treated as a precursor alarm, not an immediate trip
         OVER_RATE_WARNING = 1.05,
+    },
+
+    -- Auto-Runback: automated burn-rate reduction on a partial system
+    -- fault (any metric crossing its HIGH_ALARM setpoint), a protective
+    -- step short of a full SCRAM. See nodes/plc.lua's pollAndEvaluate().
+    RUNBACK = {
+        REDUCTION_FACTOR = 0.5, -- fraction of current burn rate commanded on runback entry
     },
 }
 
@@ -150,6 +176,21 @@ config.STATES = {
     SCRAMMED          = "SCRAMMED",
     MAINTENANCE       = "MAINTENANCE",       -- administrative lockout
     MANUAL_OVERRIDE   = "MANUAL_OVERRIDE",
+}
+
+-- ===========================================================================
+-- OPERATING MODES (plant lifecycle phase, orthogonal to STATES above -
+-- STATES is safety/alarm status, this is "what phase of startup/operation
+-- is the plant in"). Derived automatically from telemetry by nodes/plc.lua;
+-- never recomputed while SCRAMMED (frozen at last value, same as every
+-- other metric on a latched trip).
+-- ===========================================================================
+config.OPERATING_MODES = {
+    COLD_START_BYPASS = "COLD_START_BYPASS", -- steam bypass open, cold, ready to start
+    RUN_UP            = "RUN_UP",            -- bypass closed, ramping burn rate up from cold
+    HOT_STANDBY       = "HOT_STANDBY",       -- not producing power, but still hot (>200F)
+    NORMAL_OPERATION  = "NORMAL_OPERATION",  -- actively producing power
+    AUTO_RUNBACK      = "AUTO_RUNBACK",      -- automated burn-rate reduction in progress
 }
 
 -- ===========================================================================
