@@ -18,6 +18,7 @@ local COMMON_FILES = {
 local ROLE_FILES = {
     supervisor = { "nodes/supervisor.lua" },
     plc        = { "nodes/plc.lua" },
+    hmi        = { "nodes/hmi.lua" },
     test       = { "test/cmd_test.lua" },
 }
 
@@ -56,7 +57,7 @@ local function downloadFile(path)
 end
 
 local function printUsage()
-    print("Usage: installer install <supervisor|plc|test>")
+    print("Usage: installer install <supervisor|plc|hmi|test>")
 end
 
 -- ---------------------------------------------------------------------------
