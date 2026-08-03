@@ -7,7 +7,7 @@
 --
 -- Usage: installer install <supervisor|plc|test>
 
-local BASE_URL = "https://raw.githubusercontent.com/Kabanosero/Minecraft-FCS-10/main/"
+local BASE_URL = "https://raw.githubusercontent.com/Kabanosero/Minecraft-FCS-10/main/FCS-10/"
 
 local COMMON_FILES = {
     "lib/config.lua",
