@@ -6,16 +6,42 @@
 -- only ever knows about reactor state via wireless telemetry, never a
 -- fissionReactorLogicAdapter.
 --
--- SCOPE OF THIS FILE (foundational pass): theming, the button registry, UI
--- rendering, and mouse-click handling only. It does not yet dofile
--- lib/config.lua or lib/secnet.lua, and clicking a button only prints a
--- debug message - it does not send anything over the network. A future
--- pass wires this into secnet using config.NETWORK.PROTOCOL_HMI to receive
--- STATE_BROADCAST/TELEMETRY from the Supervisor and send COMMAND requests
--- back to it (see nodes/supervisor.lua's header: "Interactive operator
--- control is a future HMI node's job").
+-- NETWORK: hosts on PROTOCOL_HMI (secnet.open), the same "this node's own
+-- protocol" role PROTOCOL_PLC/PROTOCOL_SUPERVISOR play for plc.lua/
+-- supervisor.lua. Outbound COMMAND messages are tagged PROTOCOL_PLC - the
+-- AUDIENCE's protocol, matching the convention plc.lua's/supervisor.lua's
+-- headers establish - and broadcast rather than sent to one PLC: this
+-- foundational build has no per-PLC registry the way supervisor.lua's
+-- `plcs` table does (it doesn't consume TELEMETRY/STATE_BROADCAST yet), so
+-- every button press is necessarily fleet-wide. SCRAM as a broadcast
+-- emergency-stop is intentional. STARTUP currently sends action =
+-- "STARTUP", which plc.lua's handleCommand does not implement (it will ACK
+-- back accepted=false, reason="unknown-action") - wired honestly as a
+-- placeholder rather than guessing an unreviewed default burn rate for
+-- SET_BURN_RATE.
+--
+-- No ACK-timeout/retry state machine like supervisor.lua's dispatchCommand
+-- - broadcasts here are fire-and-forget, and inbound ACKs are only logged
+-- to the status console (via logStatus, never raw print/term writes) for
+-- operator feedback, not tracked or retried.
+
+local okCfg, config = pcall(dofile, "/lib/config.lua")
+if not okCfg then
+    print("[HMI] FATAL: failed to load /lib/config.lua: " .. tostring(config))
+    return
+end
+
+local okSn, secnet = pcall(dofile, "/lib/secnet.lua")
+if not okSn then
+    print("[HMI] FATAL: failed to load /lib/secnet.lua: " .. tostring(secnet))
+    return
+end
+
+local NET = config.NETWORK
+local MSG = config.NETWORK.MSG_TYPE
 
 local TITLE = "FCS-10 Supervisor"
+local STATUS_TOP = 15  -- first row of the reserved status console (bottom of screen)
 
 -- ===========================================================================
 -- THEMING
@@ -80,16 +106,82 @@ local function drawButton(btn)
     term.write(btn.label)
 end
 
+local function drawStatusBox(w, h)
+    term.setBackgroundColor(currentTheme.headerBg)
+    term.setTextColor(currentTheme.headerText)
+    for row = STATUS_TOP, h do
+        term.setCursorPos(1, row)
+        term.write(string.rep(" ", w))
+    end
+end
+
 local function drawUI()
     term.setBackgroundColor(currentTheme.bg)
     term.setTextColor(currentTheme.text)
     term.clear()
 
-    local w = ({ term.getSize() })[1]
+    local w, h = term.getSize()
     drawHeader(w)
+    drawStatusBox(w, h)
 
     for _, btn in ipairs(buttons) do
         drawButton(btn)
+    end
+end
+
+-- ===========================================================================
+-- STATUS CONSOLE
+-- ===========================================================================
+-- All event feedback must go through here, never raw print() - print()
+-- writes at the shell cursor and scrolls the terminal on overflow, which
+-- would tear up the header/button chrome drawn above. logStatus always
+-- targets the same fixed row and blanks it first, so it can never bleed
+-- outside the reserved status box or leave stale characters behind.
+local function logStatus(msg)
+    local w, h = term.getSize()
+    if h < STATUS_TOP then return end
+
+    term.setBackgroundColor(currentTheme.headerBg)
+    term.setTextColor(currentTheme.headerText)
+    term.setCursorPos(1, STATUS_TOP)
+    term.write(string.rep(" ", w))
+    term.setCursorPos(2, STATUS_TOP)
+    term.write(msg)
+end
+
+-- ===========================================================================
+-- COMMAND DISPATCH
+-- ===========================================================================
+-- Payload contract established by plc.lua's handleCommand (see
+-- nodes/plc.lua): { action = "SET_BURN_RATE" | "SCRAM", value = <required
+-- for SET_BURN_RATE>, requestId }. Only button ids listed in
+-- COMMAND_ACTIONS carry a network action - "exit" has none, so sendCommand
+-- silently no-ops for it (a purely local UI button, never wire traffic).
+local nextRequestIdCounter = 0
+local function nextRequestId()
+    nextRequestIdCounter = nextRequestIdCounter + 1
+    return nextRequestIdCounter
+end
+
+local COMMAND_ACTIONS = {
+    startup = "STARTUP",
+    scram   = "SCRAM",
+}
+
+local function sendCommand(btnId)
+    local action = COMMAND_ACTIONS[btnId]
+    if not action then
+        return
+    end
+
+    local ok, err = secnet.broadcast(NET.PROTOCOL_PLC, MSG.COMMAND, {
+        action    = action,
+        requestId = nextRequestId(),
+    })
+    if ok then
+        logStatus("[HMI] " .. action .. " broadcast sent")
+    else
+        logStatus("[HMI] " .. action .. " broadcast FAILED: " .. tostring(err))
     end
 end
 
@@ -110,17 +202,44 @@ end
 -- ===========================================================================
 drawUI()
 
+-- secnet.open() handles modem/rednet open AND secret-key loading
+-- internally (see lib/secnet.lua's loadSecret(), sourced from
+-- config.SECURITY.SECRET_FILE with a loud DEV_DEFAULT_SECRET fallback) -
+-- nodes never touch the secret directly, matching plc.lua/supervisor.lua.
+-- Non-fatal like both of those: a failed open leaves the local UI usable,
+-- it just means every sendCommand() broadcast below will fail too.
+local okOpen, openErr = secnet.open(nil, NET.PROTOCOL_HMI)
+if okOpen then
+    logStatus("[HMI] secnet open on " .. NET.PROTOCOL_HMI)
+else
+    logStatus("[HMI] WARNING: secnet.open failed (" .. tostring(openErr) .. ")")
+end
+
 while true do
-    local event, side, x, y = os.pullEvent()
+    local event, p1, p2, p3 = os.pullEvent()
 
     if event == "mouse_click" then
-        local btn = hitTest(x, y)
+        local btn = hitTest(p2, p3)
         if btn then
-            print("[HMI] " .. btn.label .. " CLICKED")
+            logStatus("[HMI] " .. btn.label .. " CLICKED")
+            sendCommand(btn.id)
         end
+    elseif event == "rednet_message" then
+        -- Routed through logStatus exactly like click feedback - never raw
+        -- print/term writes here, so an incoming ACK can never corrupt the
+        -- button grid or header (see STATUS CONSOLE section above).
+        local fromId, msgType, payload = secnet.handleEvent(p1, p2)
+        if fromId and msgType == MSG.ACK and type(payload) == "table" then
+            logStatus(("[HMI] ACK #%s: %s%s"):format(
+                tostring(payload.requestId),
+                payload.accepted and "accepted" or "rejected",
+                payload.reason and (" (" .. payload.reason .. ")") or ""))
+        end
+        -- rejections (nil, reason) from secnet.handleEvent are not errors -
+        -- ignore and keep the loop running, matching plc.lua/supervisor.lua.
     end
 
-    -- Future branches: "timer" (redraw cadence) and "rednet_message"
-    -- (secnet telemetry/state updates) once this node is wired to the
-    -- network, following supervisor.lua's dispatch-by-event-type pattern.
+    -- Future: "timer" branch (periodic redraw/re-broadcast) and full
+    -- STATE_BROADCAST/TELEMETRY consumption once this node tracks live PLC
+    -- state, not just command dispatch.
 end
