@@ -140,6 +140,137 @@ local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryO
 local broadcastTelemetry
 
 -- ===========================================================================
+-- VISUAL DASHBOARD - a single, continuously-redrawn status screen, same
+-- move nodes/hmi.lua/supervisor.lua already made away from a plain print()
+-- scroll. Every print() call site below this point (i.e. everything
+-- reachable once main() draws the first frame) is replaced with logLine()
+-- instead: print() writes at the shell cursor and scrolls the terminal on
+-- overflow, which would tear up this drawn screen exactly the way
+-- nodes/hmi.lua's own STATUS CONSOLE comment already documents for that
+-- file - a full-screen dashboard and raw print() cannot coexist. The
+-- handful of print()s ABOVE this point (config/secnet FATAL, the rbac
+-- WARNING) are deliberately left as raw prints: they happen during the
+-- plain boot scroll before the first draw() below wipes the screen clean,
+-- the same idiom hmi.lua already established for its own pre-drawUI()
+-- secnet.open() warning.
+--
+-- Read-only, same as every other node's display - no mouse_click handling.
+-- This node's whole reason for existing is autonomous local protection; an
+-- operator standing at ITS terminal issuing commands would bypass the
+-- network-authenticated COMMAND path every real control surface
+-- (Supervisor/HMI/test harness) goes through, and this file's event loop
+-- has no branch that would notice a click anyway.
+-- ===========================================================================
+local LOG_LINES = 6
+local uiLog = {}
+
+local function logLine(msg)
+    uiLog[#uiLog + 1] = msg
+    while #uiLog > LOG_LINES do
+        table.remove(uiLog, 1)
+    end
+end
+
+local function fmtAge(ms)
+    if ms < 0 then
+        ms = 0
+    end
+    local s = ms / 1000
+    if s < 60 then
+        return string.format("%.0fs", s)
+    end
+    return string.format("%.0fm", s / 60)
+end
+
+local STATE_COLOR = {
+    [STATES.NORMAL]   = colors.green,
+    [STATES.ANOMALY]  = colors.orange,
+    [STATES.SCRAMMED] = colors.red,
+}
+
+local function draw()
+    local w, h = term.getSize()
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+
+    term.setCursorPos(1, 1)
+    term.write(("FCS-10 PLC #%d"):format(os.getComputerID()))
+
+    -- Colored status bar, same convention as supervisor.lua's SYSTEM line -
+    -- plantState is the safety/alarm status, operatingMode the lifecycle
+    -- phase (see file header "OPERATING MODES") - both matter enough to an
+    -- operator to always be visible, never tabbed away.
+    term.setCursorPos(1, 2)
+    term.setBackgroundColor(STATE_COLOR[reactorState.plantState] or colors.gray)
+    term.setTextColor(colors.black)
+    local stateLine = (" STATE: %s   MODE: %s "):format(
+        reactorState.plantState, (operatingMode or "?"):gsub("_", " "))
+    term.write(stateLine .. string.rep(" ", math.max(0, w - #stateLine)))
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+
+    local dataColor = reactorState.online and colors.white or colors.orange
+    term.setTextColor(dataColor)
+
+    term.setCursorPos(1, 4)
+    term.write(("DMG  %5.1f%%   T-K  %5.0f   CLT %5.1f%%  WST %5.1f%%"):format(
+        reactorState.damagePct, reactorState.coreTempK, reactorState.coolantPct, reactorState.wastePct))
+
+    local ageText = reactorState.lastUpdate > 0
+        and fmtAge(os.epoch("utc") - reactorState.lastUpdate) or "--"
+    term.setCursorPos(1, 5)
+    term.write(("BURN %5.1f mB/t   HW: %-7s  AGE: %s"):format(
+        reactorState.burnRateMbT, peripheralPresent and "PRESENT" or "ABSENT", ageText))
+    term.setTextColor(colors.white)
+
+    term.setCursorPos(1, 7)
+    if lotoTag then
+        term.setTextColor(colors.red)
+        term.write(("LOTO: TAGGED - %s"):format(lotoTag.reason))
+        term.setTextColor(colors.white)
+    else
+        term.write("LOTO: none")
+    end
+
+    term.setCursorPos(1, 8)
+    term.write(("TESTING: %-3s  EPG: %-6s  ACT: %s"):format(
+        testingMode and "ON" or "off",
+        epgActive and "ACTIVE" or "--",
+        lastScramActuationConfirmed == nil and "--"
+            or (lastScramActuationConfirmed and "CONFIRMED" or "UNCONFIRMED")))
+
+    term.setCursorPos(1, 10)
+    term.setTextColor(colors.gray)
+    term.write("LOG:")
+    term.setTextColor(colors.white)
+    for i, line in ipairs(uiLog) do
+        local row = 10 + i
+        if row > h then
+            break
+        end
+        term.setCursorPos(1, row)
+        local text = line
+        if #text > w then
+            text = text:sub(1, w)
+        end
+        term.write(text)
+    end
+end
+
+-- Dedicated pcall boundary, same reasoning as supervisor.lua's safeRedraw():
+-- drawing must never be allowed to kill this node's main loop. Falls back
+-- to a raw print() on failure since a broken draw() means the on-screen log
+-- panel itself may not be trustworthy right now.
+local function safeDraw()
+    local ok, err = pcall(draw)
+    if not ok then
+        print("[PLC] draw failed (non-fatal): " .. tostring(err))
+    end
+end
+
+-- ===========================================================================
 -- Peripheral loss / reacquisition
 -- ===========================================================================
 -- Shared transition-handler for "we no longer have a working reactor
@@ -161,7 +292,8 @@ local function unbindReactor(reason)
         reactorState.plantState = STATES.ANOMALY
     end
 
-    print("[PLC] reactor peripheral lost: " .. tostring(reason))
+    logLine("reactor peripheral lost: " .. tostring(reason))
+    safeDraw()
 
     -- Immediate out-of-cycle broadcast (in addition to the regular 1s
     -- cadence) so the Supervisor learns about hardware loss as fast as
@@ -226,7 +358,8 @@ local function tryBindReactor(sideHint)
     if wrapped and side then
         reactor, reactorSide, peripheralPresent = wrapped, side, true
         reactorState.online = true
-        print("[PLC] reactor bound on side " .. side)
+        logLine("reactor bound on side " .. side)
+        safeDraw()
     end
 end
 
@@ -246,7 +379,8 @@ local function tryOpenSecnet()
     local ok, err = secnet.open(nil, NET.PROTOCOL_PLC)
     if ok then
         secnetOpen = true
-        print("[PLC] secnet opened")
+        logLine("secnet opened")
+        safeDraw()
     end
     return ok, err
 end
@@ -304,9 +438,10 @@ local function doScram(reason)
     -- as SCRAM itself has no reset mechanism yet either.
     epgActive = true
 
-    print(("[PLC] SCRAM (%s): %s"):format(
+    logLine(("SCRAM (%s): %s"):format(
         lastScramActuationConfirmed and "actuation confirmed" or "**ACTUATION UNCONFIRMED**",
         reason))
+    safeDraw()
 
     secnet.broadcast(NET.PROTOCOL_SUPERVISOR, MSG.SCRAM, {
         reason = reason,
@@ -403,12 +538,12 @@ local function pollAndEvaluate()
                         local newRate = reactorState.burnRateMbT * SP.RUNBACK.REDUCTION_FACTOR
                         local okRunback = pcall(reactor.setBurnRate, newRate)
                         if okRunback then
-                            print(("[PLC] AUTO-RUNBACK: burn rate reduced to %.1f mB/t"):format(newRate))
+                            logLine(("AUTO-RUNBACK: burn rate reduced to %.1f mB/t"):format(newRate))
                         end
                     end
                 elseif inRunback and recovered then
                     inRunback = false
-                    print("[PLC] AUTO-RUNBACK cleared - conditions recovered")
+                    logLine("AUTO-RUNBACK cleared - conditions recovered")
                 end
 
                 if inRunback then
@@ -432,8 +567,16 @@ local function pollAndEvaluate()
 
     local ok, err = broadcastTelemetry()
     if not ok then
-        print("[PLC] telemetry broadcast failed: " .. tostring(err))
+        logLine("telemetry broadcast failed: " .. tostring(err))
     end
+
+    -- Single point of control for the per-tick screen refresh: this
+    -- function runs on every poll (1Hz) plus once immediately at boot (see
+    -- main()), so putting safeDraw() here covers the continuously-changing
+    -- telemetry values (damage/temp/coolant/waste/burn/age) without needing
+    -- a separate redraw timer, the same way supervisor.lua's uiTimerId
+    -- drives its own periodic safeRedraw().
+    safeDraw()
 end
 
 -- ===========================================================================
@@ -553,8 +696,9 @@ local function handleCommand(fromId, payload)
         -- re-applying while already tagged overwrites reason/timestamp/
         -- appliedBy, it does not stack.
         lotoTag = { reason = payload.reason, appliedAt = os.epoch("utc"), appliedBy = fromId }
-        print(("[PLC] LOTO TAG APPLIED by #%d: %s"):format(fromId, payload.reason))
+        logLine(("LOTO TAG APPLIED by #%d: %s"):format(fromId, payload.reason))
         broadcastTelemetry() -- immediate out-of-cycle update, same pattern as unbindReactor()
+        safeDraw()
 
         sendAck(fromId, action, true, nil, requestId)
         return
@@ -569,8 +713,9 @@ local function handleCommand(fromId, payload)
         -- doScram()'s idempotent-latch philosophy: the requested end-state
         -- (untagged) is already true.
         lotoTag = nil
-        print(("[PLC] LOTO TAG REMOVED by #%d"):format(fromId))
+        logLine(("LOTO TAG REMOVED by #%d"):format(fromId))
         broadcastTelemetry()
+        safeDraw()
 
         sendAck(fromId, action, true, nil, requestId)
         return
@@ -580,16 +725,18 @@ local function handleCommand(fromId, payload)
         -- Operator-tier "non-critical valve" - no RBAC gate, no interlocks
         -- (deliberately simple: this is a simulated valve, see header).
         steamBypassOpen = true
-        print(("[PLC] Steam bypass OPENED via COMMAND from #%d"):format(fromId))
+        logLine(("Steam bypass OPENED via COMMAND from #%d"):format(fromId))
         broadcastTelemetry()
+        safeDraw()
         sendAck(fromId, action, true, nil, requestId)
         return
     end
 
     if action == "CLOSE_STEAM_BYPASS" then
         steamBypassOpen = false
-        print(("[PLC] Steam bypass CLOSED via COMMAND from #%d"):format(fromId))
+        logLine(("Steam bypass CLOSED via COMMAND from #%d"):format(fromId))
         broadcastTelemetry()
+        safeDraw()
         sendAck(fromId, action, true, nil, requestId)
         return
     end
@@ -599,8 +746,9 @@ local function handleCommand(fromId, payload)
             return
         end
         testingMode = true
-        print(("[PLC] TESTING MODE ENTERED by #%d"):format(fromId))
+        logLine(("TESTING MODE ENTERED by #%d"):format(fromId))
         broadcastTelemetry()
+        safeDraw()
         sendAck(fromId, action, true, nil, requestId)
         return
     end
@@ -610,8 +758,9 @@ local function handleCommand(fromId, payload)
             return
         end
         testingMode = false
-        print(("[PLC] TESTING MODE EXITED by #%d"):format(fromId))
+        logLine(("TESTING MODE EXITED by #%d"):format(fromId))
         broadcastTelemetry()
+        safeDraw()
         sendAck(fromId, action, true, nil, requestId)
         return
     end
@@ -625,17 +774,21 @@ end
 -- never an un-yielded while true.
 -- ===========================================================================
 local function main()
-    print("[PLC] FCS-10 Core PLC booting on computer #" .. os.getComputerID())
+    -- Logged (not printed) before anything else runs, so it's already the
+    -- oldest entry in the log panel by the time the first draw() happens -
+    -- tryBindReactor()/tryOpenSecnet() below may each trigger their own
+    -- safeDraw() immediately if they succeed on the first try.
+    logLine("FCS-10 Core PLC booting on computer #" .. os.getComputerID())
 
     tryBindReactor(nil)
     if not reactor then
         reactorState.plantState = STATES.ANOMALY
-        print("[PLC] WARNING: no " .. REACTOR_TYPE .. " found at startup - LPS running in hardware-absent mode")
+        logLine("WARNING: no " .. REACTOR_TYPE .. " found at startup - LPS running in hardware-absent mode")
     end
 
     local okOpen, openErr = tryOpenSecnet()
     if not okOpen then
-        print("[PLC] WARNING: secnet.open failed (" .. tostring(openErr) .. ") - local LPS protection remains fully active; will keep retrying as peripherals attach")
+        logLine("WARNING: secnet.open failed (" .. tostring(openErr) .. ") - will keep retrying as peripherals attach")
     end
 
     pollAndEvaluate() -- immediate first pass, don't wait a full cadence before the first LPS check
@@ -692,7 +845,8 @@ local function main()
         end)
 
         if not ok then
-            print("[PLC] event handler error (non-fatal, loop continues): " .. tostring(err))
+            logLine("event handler error (non-fatal, loop continues): " .. tostring(err))
+            safeDraw()
         end
     end
 end

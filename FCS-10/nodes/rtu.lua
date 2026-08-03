@@ -89,6 +89,134 @@ local peripheralPresent  = false  -- true only while `reactor` is a live, workin
 local rtuState           = config.newDefaultReactorState() -- reused SSOT shape, mutated in place
 rtuState.fuelPct = 0 -- RTU-specific extension field, not part of the SSOT shape (see header)
 
+local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
+
+-- ===========================================================================
+-- VISUAL DASHBOARD - a single, continuously-redrawn status screen, same
+-- move nodes/hmi.lua/supervisor.lua/nodes/plc.lua already made away from a
+-- plain print() scroll. Every print() call site below this point is
+-- replaced with logLine() instead - print() writes at the shell cursor and
+-- scrolls the terminal on overflow, which would tear up this drawn screen
+-- exactly the way nodes/hmi.lua's own STATUS CONSOLE comment already
+-- documents for that file. The two print()s ABOVE this point (config/secnet
+-- FATAL) are deliberately left as raw prints: they happen during the plain
+-- boot scroll before the first draw() below wipes the screen clean.
+--
+-- Read-only - no mouse_click handling. This node has no actuator and no
+-- command handling (see header "WHY NO WATCHDOG / NO COMMAND HANDLING") -
+-- there is nothing for an on-screen control to do.
+-- ===========================================================================
+local LOG_LINES = 6
+local uiLog = {}
+
+local function logLine(msg)
+    uiLog[#uiLog + 1] = msg
+    while #uiLog > LOG_LINES do
+        table.remove(uiLog, 1)
+    end
+end
+
+local function fmtAge(ms)
+    if ms < 0 then
+        ms = 0
+    end
+    local s = ms / 1000
+    if s < 60 then
+        return string.format("%.0fs", s)
+    end
+    return string.format("%.0fm", s / 60)
+end
+
+-- Only NORMAL/ANOMALY are possible here (see header "plantState / activeEAL
+-- SEMANTICS") - this node never SCRAMs, so there is no red state to color.
+local STATE_COLOR = {
+    [STATES.NORMAL]  = colors.green,
+    [STATES.ANOMALY] = colors.orange,
+}
+
+local function draw()
+    local w, h = term.getSize()
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+
+    term.setCursorPos(1, 1)
+    term.write(("FCS-10 RTU #%d"):format(os.getComputerID()))
+
+    term.setCursorPos(1, 2)
+    term.setBackgroundColor(STATE_COLOR[rtuState.plantState] or colors.gray)
+    term.setTextColor(colors.black)
+    local stateLine = (" STATE: %s   (monitor-only, no trip authority) "):format(rtuState.plantState)
+    term.write(stateLine .. string.rep(" ", math.max(0, w - #stateLine)))
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+
+    local dataColor = rtuState.online and colors.white or colors.orange
+    term.setTextColor(dataColor)
+
+    term.setCursorPos(1, 4)
+    term.write(("DMG  %5.1f%%   T-K  %5.0f   CLT %5.1f%%  WST %5.1f%%"):format(
+        rtuState.damagePct, rtuState.coreTempK, rtuState.coolantPct, rtuState.wastePct))
+
+    term.setCursorPos(1, 5)
+    term.write(("BURN %5.1f mB/t   FUEL %5.1f%%"):format(rtuState.burnRateMbT, rtuState.fuelPct))
+
+    local ageText = rtuState.lastUpdate > 0
+        and fmtAge(os.epoch("utc") - rtuState.lastUpdate) or "--"
+    term.setCursorPos(1, 6)
+    term.write(("HW: %-7s        AGE: %s"):format(
+        peripheralPresent and "PRESENT" or "ABSENT", ageText))
+    term.setTextColor(colors.white)
+
+    term.setCursorPos(1, 8)
+    term.setTextColor(colors.gray)
+    term.write("LOG:")
+    term.setTextColor(colors.white)
+    for i, line in ipairs(uiLog) do
+        local row = 8 + i
+        if row > h then
+            break
+        end
+        term.setCursorPos(1, row)
+        local text = line
+        if #text > w then
+            text = text:sub(1, w)
+        end
+        term.write(text)
+    end
+end
+
+-- Dedicated pcall boundary, same reasoning as supervisor.lua's safeRedraw()/
+-- plc.lua's safeDraw(): drawing must never be allowed to kill this node's
+-- main loop.
+local function safeDraw()
+    local ok, err = pcall(draw)
+    if not ok then
+        print("[RTU] draw failed (non-fatal): " .. tostring(err))
+    end
+end
+
+-- secnet.open()'s only failure mode is "no modem found this call" (see
+-- lib/secnet.lua) - often just a boot-order race, since a modem peripheral
+-- can attach a tick or two after the computer itself starts running. Same
+-- retry pattern as nodes/plc.lua/nodes/supervisor.lua/nodes/hmi.lua's
+-- tryOpenSecnet: retried opportunistically every poll tick and on every
+-- "peripheral" attach event, so a transient miss at boot doesn't leave this
+-- node's telemetry permanently unreachable.
+local function tryOpenSecnet()
+    if secnetOpen then
+        return true
+    end
+    local ok, err = secnet.open(nil, NET.PROTOCOL_RTU)
+    if ok then
+        secnetOpen = true
+        logLine("secnet opened")
+        safeDraw()
+    end
+    return ok, err
+end
+
 -- ===========================================================================
 -- Peripheral loss / reacquisition
 -- ===========================================================================
@@ -104,7 +232,8 @@ local function unbindReactor(reason)
     rtuState.online     = false -- other metrics deliberately left as-is (last known values)
     rtuState.plantState = STATES.ANOMALY
 
-    print("[RTU] reactor peripheral lost: " .. tostring(reason))
+    logLine("reactor peripheral lost: " .. tostring(reason))
+    safeDraw()
 
     -- Immediate out-of-cycle broadcast, same reasoning as plc.lua: the
     -- Supervisor should learn about hardware loss as fast as possible
@@ -152,7 +281,8 @@ local function tryBindReactor(sideHint)
     if wrapped and side then
         reactor, reactorSide, peripheralPresent = wrapped, side, true
         rtuState.online = true
-        print("[RTU] reactor bound on side " .. side)
+        logLine("reactor bound on side " .. side)
+        safeDraw()
     end
 end
 
@@ -198,6 +328,8 @@ local function pollAndPublish()
         tryBindReactor(nil) -- opportunistic retry; "peripheral" event handles the common case
     end
 
+    tryOpenSecnet() -- opportunistic retry; "peripheral" event handles the common case
+
     local ok, err = secnet.broadcast(NET.PROTOCOL_SUPERVISOR, MSG.TELEMETRY, {
         state             = rtuState,
         peripheralPresent = peripheralPresent,
@@ -205,8 +337,13 @@ local function pollAndPublish()
         role              = "RTU",
     })
     if not ok then
-        print("[RTU] telemetry broadcast failed: " .. tostring(err))
+        logLine("telemetry broadcast failed: " .. tostring(err))
     end
+
+    -- Single point of control for the per-tick screen refresh - this
+    -- function runs on every poll (1Hz) plus once immediately at boot (see
+    -- main()), same reasoning as nodes/plc.lua's pollAndEvaluate.
+    safeDraw()
 end
 
 -- ===========================================================================
@@ -215,17 +352,19 @@ end
 -- never sleep(), never an un-yielded while true.
 -- ===========================================================================
 local function main()
-    print("[RTU] FCS-10 Zone RTU booting on computer #" .. os.getComputerID())
+    -- Logged (not printed) before anything else runs, so it's already the
+    -- oldest entry in the log panel by the time the first draw() happens.
+    logLine("FCS-10 Zone RTU booting on computer #" .. os.getComputerID())
 
     tryBindReactor(nil)
     if not reactor then
         rtuState.plantState = STATES.ANOMALY
-        print("[RTU] WARNING: no " .. REACTOR_TYPE .. " found at startup - running in hardware-absent mode")
+        logLine("WARNING: no " .. REACTOR_TYPE .. " found at startup - running in hardware-absent mode")
     end
 
-    local okOpen, openErr = secnet.open(nil, NET.PROTOCOL_RTU)
+    local okOpen, openErr = tryOpenSecnet()
     if not okOpen then
-        print("[RTU] WARNING: secnet.open failed (" .. tostring(openErr) .. ") - telemetry will not reach the network")
+        logLine("WARNING: secnet.open failed (" .. tostring(openErr) .. ") - will keep retrying as peripherals attach")
     end
 
     pollAndPublish() -- immediate first pass, don't wait a full cadence
@@ -264,6 +403,7 @@ local function main()
                 secnet.handleEvent(p1, p2)
             elseif event == "peripheral" then
                 tryBindReactor(p1)
+                tryOpenSecnet() -- a modem attaching this tick is exactly what "peripheral" fires for
             elseif event == "peripheral_detach" then
                 if p1 == reactorSide then
                     unbindReactor("peripheral_detach on side " .. tostring(p1))
@@ -272,7 +412,8 @@ local function main()
         end)
 
         if not ok then
-            print("[RTU] event handler error (non-fatal, loop continues): " .. tostring(err))
+            logLine("event handler error (non-fatal, loop continues): " .. tostring(err))
+            safeDraw()
         end
     end
 end

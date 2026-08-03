@@ -20,9 +20,12 @@
 -- Getting this backwards would silently mean PLCs never see the heartbeat
 -- that is supposed to stop them fail-safe SCRAMming.
 --
--- SCOPE: mostly read-only monitoring, plus a click-only command interface
--- (SCRAM / OPEN BYPASS / CLOSE BYPASS buttons, on whichever PLC row is
--- clicked first) and a fuller callable command interface
+-- SCOPE: mostly read-only monitoring, split across 3 tabs (SVR/PLC/RTU -
+-- see the "Tab bar" section below) so the system-wide summary and the two
+-- role-specific tables each get the whole terminal body instead of sharing
+-- one screen, plus a click-only command interface (SCRAM / OPEN BYPASS /
+-- CLOSE BYPASS buttons, on whichever PLC row is clicked first) and a fuller
+-- callable command interface
 -- (sendBurnRateCommand/sendApplyTagCommand/etc, all the way up to
 -- sendExitTestingCommand) reachable from a REPL pulled into this running
 -- script. The buttons are deliberately click-only, never a typed-input
@@ -153,6 +156,13 @@ local selectedPlcId        = nil -- clicked PLC row, target of the click-only ac
 local lastRenderedRows      = {}
 local lastRenderedTableTop  = nil
 local lastRenderedButtons   = {}
+local lastRenderedTabs      = {} -- tab bar bounds, same capture pattern as lastRenderedButtons
+
+-- Which of the 3 tabs (see TABS/drawTabBar below) is currently showing.
+-- "SVR" is the landing tab: an operator's first question on opening this
+-- screen is "is everything OK overall", not "show me every PLC row" -
+-- matches aggregateStatus()'s own role as the single system-wide verdict.
+local currentTab = "SVR"
 
 local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
 
@@ -687,24 +697,56 @@ local function formatCommandStatus(pend)
         pend.payload.action, pend.plcId, pend.attempt, NET.COMMAND_RETRY_COUNT)
 end
 
--- Full clear + redraw-everything each tick: simplest, most robust choice
--- at a 1Hz cadence on a small CC terminal - no differential rendering.
--- Rows longer than the terminal width are simply clipped by term.write
--- itself (CC terminals don't auto-wrap on write), which is why there is no
--- separate column-dropping logic here: on a narrow terminal the trailing
--- columns (burn rate, age) are what naturally disappear first.
-local function redraw()
-    local w, h = term.getSize()
+-- ---------------------------------------------------------------------------
+-- Tab bar (SVR / PLC / RTU) - row 2, directly under the title. Splitting
+-- what used to be one flat screen (5 summary lines + one mixed PLC+RTU
+-- table, all fighting for the same rows) into per-category tabs gives each
+-- one the whole body of the terminal instead: SVR is the "is everything OK"
+-- overview, PLC and RTU are each a dedicated, undiluted table for their own
+-- role - and an RTU (no trip/protective authority - see plcBucket() above)
+-- no longer visually competes with real PLCs for table rows on a small
+-- terminal even though it's already excluded from the PLC count/status.
+-- ---------------------------------------------------------------------------
+local TABS = { "SVR", "PLC", "RTU" }
 
+local function drawTabBar(w)
+    lastRenderedTabs = {}
+    local x = 1
+    for _, tab in ipairs(TABS) do
+        local label = " " .. tab .. " "
+        if tab == currentTab then
+            term.setBackgroundColor(colors.white)
+            term.setTextColor(colors.black)
+        else
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(colors.lightGray)
+        end
+        term.setCursorPos(x, 2)
+        term.write(label)
+        lastRenderedTabs[#lastRenderedTabs + 1] = { id = tab, x = x, y = 2, width = #label }
+        x = x + #label
+    end
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    if x <= w then
+        term.write(string.rep(" ", w - x + 1))
+    end
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
-    term.clear()
+end
 
-    term.setCursorPos(1, 1)
-    term.write(("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()))
+-- SVR tab: the system-wide summary that used to occupy rows 2-6 of the old
+-- single-screen layout, now with the whole body to itself. No table, no
+-- action buttons - those live on the PLC tab (see drawRoleTab below), so
+-- this tab always clears the row-selection render cache to keep a stray
+-- click here from being misread as a table/button hit.
+local function drawSvrTab(w)
+    lastRenderedRows = {}
+    lastRenderedTableTop = nil
+    lastRenderedButtons = {}
 
-    -- RTU records are excluded from the "(N PLCs, N offline)" header tally
-    -- - that count is specifically about the protected reactor fleet, not
+    -- RTU records are excluded from the "(N PLCs, N offline)" tally - that
+    -- count is specifically about the protected reactor fleet, not
     -- supplementary monitoring points (see aggregateStatus() above).
     local plcCount, offlineCount, lotoCount = 0, 0, 0
     for _, rec in pairs(plcs) do
@@ -720,7 +762,7 @@ local function redraw()
     end
 
     local status = aggregateStatus()
-    term.setCursorPos(1, 2)
+    term.setCursorPos(1, 3)
     term.setBackgroundColor(STATUS_COLOR[status] or colors.gray)
     term.setTextColor(colors.black)
     local headerLine = (" SYSTEM: %s  (%d PLC%s, %d offline) "):format(
@@ -729,13 +771,29 @@ local function redraw()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
 
-    term.setCursorPos(1, 3)
+    term.setCursorPos(1, 4)
     term.write(("HB TX: %s ago (%ds cadence)"):format(fmtAge(os.epoch("utc") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S))
 
-    term.setCursorPos(1, 4)
+    -- Surfaces secnetOpen (tracked for tryOpenSecnet's retry logic - see
+    -- module state above) directly to the operator: a Supervisor stuck
+    -- unable to open its own modem is the single worst failure mode in
+    -- this whole project (every PLC fail-safe SCRAMs once it can't hear a
+    -- heartbeat), so it deserves to be visible here, not just in the log.
+    term.setCursorPos(1, 5)
+    term.write("MODEM: ")
+    if secnetOpen then
+        term.setTextColor(colors.green)
+        term.write("OPEN")
+    else
+        term.setTextColor(colors.red)
+        term.write("NOT OPEN (retrying)")
+    end
+    term.setTextColor(colors.white)
+
+    term.setCursorPos(1, 6)
     term.write("CMD: " .. formatCommandStatus(lastCommandRef))
 
-    term.setCursorPos(1, 5)
+    term.setCursorPos(1, 7)
     if lastScramGlobal then
         local scramPlc = plcs[lastScramGlobal.plcId]
         local epgNote = (scramPlc and scramPlc.epgActive) and " (EPG ACTIVE)" or ""
@@ -748,7 +806,7 @@ local function redraw()
         term.write("LAST SCRAM: none yet")
     end
 
-    term.setCursorPos(1, 6)
+    term.setCursorPos(1, 8)
     if lotoCount > 0 then
         term.setTextColor(colors.red)
         term.write(("LOTO: %d reactor%s tagged"):format(lotoCount, lotoCount == 1 and "" or "s"))
@@ -756,27 +814,32 @@ local function redraw()
     else
         term.write("LOTO: none active")
     end
+end
 
-    -- Click-only action buttons, bottom-anchored to `h` so they're always
-    -- in the same place regardless of table content/height (independent of
-    -- the tableTop-relative region below). Act on `selectedPlcId` - see
-    -- main()'s mouse_click handler. Drawn before the table's own
-    -- narrow-terminal guard below so they still show even if the table
-    -- itself doesn't fit.
-    local buttons = {
-        { id = "scram",        label = "SCRAM",        x = 1,  y = h, width = 10, colorKey = "btnDanger"  },
-        { id = "open_bypass",  label = "OPEN BYPASS",  x = 12, y = h, width = 14, colorKey = "btnSafe"    },
-        { id = "close_bypass", label = "CLOSE BYPASS", x = 27, y = h, width = 15, colorKey = "btnNeutral" },
-    }
-    for _, btn in ipairs(buttons) do
-        drawButton(btn, false)
+-- PLC/RTU tabs: a dedicated table filtered by `predicate(rec)`, worst-first
+-- sorted exactly as the old single mixed table was. `showButtons` gates the
+-- SCRAM/OPEN BYPASS/CLOSE BYPASS row: only the PLC tab gets it - an RTU has
+-- no trip/protective authority (see plcBucket()'s own comment) so there is
+-- nothing for those buttons to legitimately act on from the RTU tab.
+local function drawRoleTab(h, predicate, showButtons)
+    local buttons = {}
+    if showButtons then
+        buttons = {
+            { id = "scram",        label = "SCRAM",        x = 1,  y = h, width = 10, colorKey = "btnDanger"  },
+            { id = "open_bypass",  label = "OPEN BYPASS",  x = 12, y = h, width = 14, colorKey = "btnSafe"    },
+            { id = "close_bypass", label = "CLOSE BYPASS", x = 27, y = h, width = 15, colorKey = "btnNeutral" },
+        }
+        for _, btn in ipairs(buttons) do
+            drawButton(btn, false)
+        end
     end
     lastRenderedButtons = buttons
 
-    local tableTop = 8
+    local tableTop = 3
     if h < tableTop then
         lastRenderedRows = {}
-        return -- terminal too short to show the PLC table at all
+        lastRenderedTableTop = nil
+        return -- terminal too short to show the table at all
     end
     -- "ID  " (4 chars, matches "#%-3d") + 2 glyph columns (LOTO "L", Testing
     -- "T", 1 char each) + "STATE" (10 chars, matches "%-10s") = 16 chars
@@ -784,11 +847,13 @@ local function redraw()
     term.setCursorPos(1, tableTop)
     term.write("ID    STATE     EAL  DMG%   T-K   CLT%  WST%  BURN  AGE")
 
-    -- Sort worst-first so that on a truncated screen the PLCs most worth
-    -- an operator's attention are always the ones still visible.
+    -- Sort worst-first so that on a truncated screen the rows most worth an
+    -- operator's attention are always the ones still visible.
     local rows = {}
-    for plcId in pairs(plcs) do
-        rows[#rows + 1] = plcId
+    for plcId, rec in pairs(plcs) do
+        if predicate(rec) then
+            rows[#rows + 1] = plcId
+        end
     end
     table.sort(rows, function(a, b)
         local ra, rb = plcs[a], plcs[b]
@@ -804,9 +869,10 @@ local function redraw()
         return a < b
     end)
 
-    -- Leave 2 lines free below the table: 1 for a possible "+N more"
-    -- footer, 1 for the button row pinned to `h` above.
-    local maxRows = math.max(0, h - tableTop - 2)
+    -- Leave room below the table for a possible "+N more" footer, plus the
+    -- button row pinned to `h` when this tab has one.
+    local reserved = showButtons and 2 or 1
+    local maxRows = math.max(0, h - tableTop - reserved)
     local shown = math.min(#rows, maxRows)
 
     lastRenderedRows = {}
@@ -829,9 +895,9 @@ local function redraw()
         else
             term.setTextColor(online and colors.white or colors.orange)
         end
-        -- "R" prefix instead of "#" for an RTU row - zero extra width, but
-        -- immediately visible so an RTU is never mistaken for a real,
-        -- protected PLC (see aggregateStatus()/plcCount above).
+        -- "R" prefix instead of "#" for an RTU row - kept even though each
+        -- tab is now role-pure, so a row's own identity stays legible if
+        -- it's ever screenshotted/logged out of context.
         term.write(string.format("%s%-3d", rec.role == "RTU" and "R" or "#", plcId))
         term.setBackgroundColor(colors.black)
 
@@ -881,6 +947,33 @@ local function redraw()
         term.setTextColor(colors.gray)
         term.write(("+%d more (all lower severity)"):format(#rows - shown))
         term.setTextColor(colors.white)
+    end
+end
+
+-- Full clear + redraw-everything each tick: simplest, most robust choice
+-- at a 1Hz cadence on a small CC terminal - no differential rendering.
+-- Rows longer than the terminal width are simply clipped by term.write
+-- itself (CC terminals don't auto-wrap on write), which is why there is no
+-- separate column-dropping logic here: on a narrow terminal the trailing
+-- columns (burn rate, age) are what naturally disappear first.
+local function redraw()
+    local w, h = term.getSize()
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+
+    term.setCursorPos(1, 1)
+    term.write(("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()))
+
+    drawTabBar(w)
+
+    if currentTab == "PLC" then
+        drawRoleTab(h, function(rec) return rec.role ~= "RTU" end, true)
+    elseif currentTab == "RTU" then
+        drawRoleTab(h, function(rec) return rec.role == "RTU" end, false)
+    else
+        drawSvrTab(w)
     end
 end
 
@@ -981,19 +1074,30 @@ local function main()
             elseif event == "mouse_click" then
                 local button, x, y = p1, p2, p3
                 if button == 1 then -- left-click only, same guard installer.lua's wizard uses for consequential actions
-                    local btn = hitTestButtons(lastRenderedButtons, x, y)
-                    if btn then
-                        if selectedPlcId then
-                            if btn.id == "scram" then
-                                sendScramCommand(selectedPlcId)
-                            elseif btn.id == "open_bypass" then
-                                sendOpenBypassCommand(selectedPlcId)
-                            elseif btn.id == "close_bypass" then
-                                sendCloseBypassCommand(selectedPlcId)
+                    local tabBtn = hitTestButtons(lastRenderedTabs, x, y)
+                    if tabBtn then
+                        -- Selection is cleared on tab switch rather than
+                        -- carried across: a stale selectedPlcId pointing at
+                        -- a row from the tab just left (or one that isn't
+                        -- even shown on the new tab) is more confusing than
+                        -- just asking the operator to reselect.
+                        currentTab = tabBtn.id
+                        selectedPlcId = nil
+                    else
+                        local btn = hitTestButtons(lastRenderedButtons, x, y)
+                        if btn then
+                            if selectedPlcId then
+                                if btn.id == "scram" then
+                                    sendScramCommand(selectedPlcId)
+                                elseif btn.id == "open_bypass" then
+                                    sendOpenBypassCommand(selectedPlcId)
+                                elseif btn.id == "close_bypass" then
+                                    sendCloseBypassCommand(selectedPlcId)
+                                end
                             end
+                        elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
+                            selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
                         end
-                    elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
-                        selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
                     end
                     safeRedraw()
                 end
