@@ -938,17 +938,41 @@ local function main()
             elseif event == "rednet_message" then
                 local fromId, msgType, payload = secnet.handleEvent(p1, p2)
                 if fromId then
-                    touchPlc(fromId)
+                    -- touchPlc() is only called for message types a real
+                    -- PLC/RTU actually originates (TELEMETRY/SCRAM/
+                    -- HEARTBEAT), NOT unconditionally for every
+                    -- authenticated message. rednet.broadcast() (unlike
+                    -- rednet.send()) reaches every rednet-open computer
+                    -- regardless of its protocol tag - the "protocol"
+                    -- string is just metadata unless the receiver
+                    -- specifically filters on it, and this loop's raw
+                    -- os.pullEvent() doesn't. So this node overhears
+                    -- broadcasts that were never meant for it too, most
+                    -- notably nodes/hmi.lua's COMMAND broadcasts (tagged
+                    -- PROTOCOL_PLC, addressed to PLCs, sent on every
+                    -- STARTUP/SCRAM button click). Blindly touchPlc(fromId)
+                    -- on those used to create a phantom "PLC" row for the
+                    -- HMI's own computer ID - no TELEMETRY ever arrives for
+                    -- it (HMI never sends any), so it would show up
+                    -- permanently OFFLINE and inflate the PLC/offline
+                    -- counts forever. ACK doesn't need touchPlc() here
+                    -- either: dispatchCommand() above already touches the
+                    -- target PLC's record before sending, so by the time
+                    -- any ACK for OUR OWN command arrives the record
+                    -- already exists.
                     if msgType == MSG.TELEMETRY then
+                        touchPlc(fromId)
                         onTelemetry(fromId, payload)
                         safeRedraw()
                     elseif msgType == MSG.SCRAM then
+                        touchPlc(fromId)
                         onScram(fromId, payload)
                         safeRedraw()
                     elseif msgType == MSG.ACK then
                         onAck(fromId, payload)
                         safeRedraw()
                     elseif msgType == MSG.HEARTBEAT then
+                        touchPlc(fromId)
                         safeRedraw()
                     end
                 end
