@@ -99,6 +99,12 @@ if not okSn then
     return
 end
 
+local okShell, os_shell = pcall(dofile, "/lib/os_shell.lua")
+if not okShell then
+    print("[PLC] FATAL: failed to load /lib/os_shell.lua: " .. tostring(os_shell))
+    return
+end
+
 -- rbac (Shift Supervisor key check) load is intentionally NON-FATAL, unlike
 -- config/secnet above: SCRAM and the LPS trip logic must never depend on
 -- it. If it fails to load, `rbac` stays nil and checkSupervisorGate() below
@@ -135,31 +141,42 @@ local inRunback       = false -- edge-detection latch for Auto-Runback entry/exi
 
 local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
 
+-- currentScreen drives ONLY which draw function runs and where mouse_click
+-- is routed - see "VISUAL DASHBOARD / DESKTOP SHELL" below. It has zero
+-- effect on the poll/broadcast/trip logic above, which runs identically no
+-- matter what's on screen.
+local currentScreen    = "desktop" -- "desktop" | "scada" | "settings" | "network"
+local lastDesktopIcons = {}        -- laid-out icon hit-regions from the last drawDesktopScreen()
+
 -- Forward-declared (defined below unbindReactor, which needs to call it)
 -- so it stays a proper local rather than leaking into _G.
 local broadcastTelemetry
 
 -- ===========================================================================
--- VISUAL DASHBOARD - a single, continuously-redrawn status screen, same
--- move nodes/hmi.lua/supervisor.lua already made away from a plain print()
--- scroll. Every print() call site below this point (i.e. everything
+-- VISUAL DASHBOARD / DESKTOP SHELL - a continuously-redrawn, screen-based
+-- UI built on lib/os_shell.lua's shared boot-splash/desktop/chrome helpers,
+-- same move nodes/hmi.lua/supervisor.lua already made away from a plain
+-- print() scroll. Every print() call site below this point (i.e. everything
 -- reachable once main() draws the first frame) is replaced with logLine()
 -- instead: print() writes at the shell cursor and scrolls the terminal on
 -- overflow, which would tear up this drawn screen exactly the way
 -- nodes/hmi.lua's own STATUS CONSOLE comment already documents for that
 -- file - a full-screen dashboard and raw print() cannot coexist. The
--- handful of print()s ABOVE this point (config/secnet FATAL, the rbac
--- WARNING) are deliberately left as raw prints: they happen during the
+-- handful of print()s ABOVE this point (config/secnet/os_shell FATAL, the
+-- rbac WARNING) are deliberately left as raw prints: they happen during the
 -- plain boot scroll before the first draw() below wipes the screen clean,
 -- the same idiom hmi.lua already established for its own pre-drawUI()
 -- secnet.open() warning.
 --
--- Read-only, same as every other node's display - no mouse_click handling.
--- This node's whole reason for existing is autonomous local protection; an
--- operator standing at ITS terminal issuing commands would bypass the
--- network-authenticated COMMAND path every real control surface
--- (Supervisor/HMI/test harness) goes through, and this file's event loop
--- has no branch that would notice a click anyway.
+-- INTERACTIVE, but navigation-only: clicking desktop icons or the HOME
+-- button in sub-screen chrome only changes currentScreen (a purely local
+-- display choice) - it never issues a reactor command. There is still NO
+-- SCRAM/burn-rate/LOTO button anywhere on this screen: an operator standing
+-- at THIS terminal issuing reactor commands would bypass the network-
+-- authenticated COMMAND path every real control surface (Supervisor/HMI/
+-- test harness) goes through. The desktop's UPDATE icon is the one
+-- exception that does something beyond navigation - it shells out to the
+-- existing installer.lua (see launchUpdater()), not a reactor action.
 -- ===========================================================================
 local LOG_LINES = 6
 local uiLog = {}
@@ -188,15 +205,16 @@ local STATE_COLOR = {
     [STATES.SCRAMMED] = colors.red,
 }
 
-local function draw()
+local homeHitRegion = nil -- HOME button hit-region from the last sub-screen chrome draw
+
+local function drawScadaScreen()
     local w, h = term.getSize()
 
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
     term.clear()
 
-    term.setCursorPos(1, 1)
-    term.write(("FCS-10 PLC #%d"):format(os.getComputerID()))
+    homeHitRegion = os_shell.drawScreenHeader(("SCADA - PLC #%d"):format(os.getComputerID()))
 
     -- Colored status bar, same convention as supervisor.lua's SYSTEM line -
     -- plantState is the safety/alarm status, operatingMode the lifecycle
@@ -259,6 +277,80 @@ local function draw()
     end
 end
 
+-- Desktop icons - "SCADA" is this node's core reactor screen (the function
+-- above); SETTINGS/NETWORK are read-only info screens; UPDATE isn't a
+-- screen at all, see launchUpdater() below.
+local DESKTOP_ICONS = {
+    { key = "scada",    label = "SCADA",    color = colors.red },
+    { key = "settings", label = "SETTINGS", color = colors.gray },
+    { key = "network",  label = "NETWORK",  color = colors.cyan },
+    { key = "update",   label = "UPDATE",   color = colors.blue },
+}
+
+local function drawDesktopScreen()
+    lastDesktopIcons = os_shell.drawDesktop({
+        title       = ("FCS-10 PLC #%d"):format(os.getComputerID()),
+        statusRight = ("STATE: %s"):format(reactorState.plantState),
+        statusColor = STATE_COLOR[reactorState.plantState] or colors.white,
+        icons       = DESKTOP_ICONS,
+        footer      = "Click an icon to launch a program.",
+    })
+end
+
+local function drawSettingsScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    homeHitRegion = os_shell.drawScreenHeader("SETTINGS")
+    os_shell.drawKeyValueList({
+        { label = "Role",           value = "PLC" },
+        { label = "Computer ID",    value = os.getComputerID() },
+        { label = "Reactor HW",     value = peripheralPresent and "PRESENT" or "ABSENT",
+          color = peripheralPresent and colors.green or colors.red },
+        { label = "Plant state",    value = reactorState.plantState,
+          color = STATE_COLOR[reactorState.plantState] or colors.white },
+        { label = "Operating mode", value = (operatingMode or "?"):gsub("_", " ") },
+        { label = "LOTO",           value = lotoTag and ("TAGGED: " .. lotoTag.reason) or "none",
+          color = lotoTag and colors.red or colors.white },
+        { label = "Testing mode",   value = testingMode and "ON" or "off" },
+        { label = "EPG",            value = epgActive and "ACTIVE" or "--" },
+    }, 3)
+end
+
+local function drawNetworkScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    homeHitRegion = os_shell.drawScreenHeader("NETWORK")
+    local ageText = reactorState.lastUpdate > 0
+        and fmtAge(os.epoch("utc") - reactorState.lastUpdate) or "--"
+    os_shell.drawKeyValueList({
+        { label = "secnet",         value = secnetOpen and "OPEN" or "NOT OPEN",
+          color = secnetOpen and colors.green or colors.red },
+        { label = "Hosts on",       value = NET.PROTOCOL_PLC },
+        { label = "Sends to",       value = NET.PROTOCOL_SUPERVISOR },
+        { label = "Last reading age", value = ageText },
+        { label = "Heartbeat every",  value = NET.HEARTBEAT_INTERVAL_S .. "s" },
+        { label = "Watchdog timeout", value = NET.HEARTBEAT_TIMEOUT_S .. "s" },
+    }, 3)
+end
+
+-- Single dispatch point every draw call site below goes through - which
+-- screen function actually runs depends only on currentScreen, a purely
+-- local display choice with no effect on the poll/trip logic above (see
+-- module state comment). Screens themselves never sleep or block.
+local function draw()
+    if currentScreen == "scada" then
+        drawScadaScreen()
+    elseif currentScreen == "settings" then
+        drawSettingsScreen()
+    elseif currentScreen == "network" then
+        drawNetworkScreen()
+    else
+        drawDesktopScreen()
+    end
+end
+
 -- Dedicated pcall boundary, same reasoning as supervisor.lua's safeRedraw():
 -- drawing must never be allowed to kill this node's main loop. Falls back
 -- to a raw print() on failure since a broken draw() means the on-screen log
@@ -268,6 +360,32 @@ local function safeDraw()
     if not ok then
         print("[PLC] draw failed (non-fatal): " .. tostring(err))
     end
+end
+
+-- Shells out to the existing installer.lua (already proven CLI: see
+-- installer.lua's "update" action) to check/update this node's own files.
+-- Deliberately targets role "plc" directly rather than the interactive
+-- "start" GUI - this desktop's UPDATE icon should only ever do the one
+-- thing it's labeled for, not also expose Install/Clear from inside a live
+-- reactor controller. shell.run() blocks until installer.lua exits, during
+-- which this node's own os.pullEvent() loop is NOT running - poll/heartbeat
+-- timers already queued still fire the instant control returns (CC:Tweaked
+-- timers are wall-clock, not pump-driven), and if the pause runs past
+-- HEARTBEAT_TIMEOUT_S the watchdog will correctly trip on resume: that is
+-- the fail-safe working as designed, not a bug, which is why this is
+-- clearly logged before launching rather than silently swallowed. Never
+-- auto-reboots (installer.lua's own "update" action only prints a
+-- reminder) - a live PLC's files changing on disk does not affect the
+-- already-running process until a deliberate, separate reboot.
+local function launchUpdater()
+    logLine("UPDATE: opening installer - reactor polling pauses until it returns")
+    safeDraw()
+    pcall(function()
+        shell.run("/installer.lua", "update", "plc")
+        os.sleep(2) -- brief, bounded pause so the printed result is readable, never indefinite
+    end)
+    logLine("UPDATE: installer closed, resuming normal operation")
+    safeDraw()
 end
 
 -- ===========================================================================
@@ -774,6 +892,18 @@ end
 -- never an un-yielded while true.
 -- ===========================================================================
 local function main()
+    -- One-time boot splash, before the main loop (and its "never block past
+    -- one os.pullEvent()" rule) starts - see file header. Purely cosmetic:
+    -- os_shell.drawBootSplash() itself never blocks, the fixed os.sleep()
+    -- here is what holds it on screen briefly.
+    os_shell.drawBootSplash({
+        title    = "FCS-10",
+        subtitle = "Core Programmable Logic Controller",
+        role     = "PLC",
+        accent   = colors.red,
+    })
+    os.sleep(1.2)
+
     -- Logged (not printed) before anything else runs, so it's already the
     -- oldest entry in the log panel by the time the first draw() happens -
     -- tryBindReactor()/tryOpenSecnet() below may each trigger their own
@@ -804,7 +934,7 @@ local function main()
     local watchdogTimerId = os.startTimer(NET.HEARTBEAT_TIMEOUT_S)
 
     while true do
-        local event, p1, p2 = os.pullEvent() -- yields every iteration; never a busy-spin
+        local event, p1, p2, p3 = os.pullEvent() -- yields every iteration; never a busy-spin
 
         -- Outer per-iteration pcall: the highest-value single line of
         -- defense in this file. Nothing above should throw, but an
@@ -840,6 +970,23 @@ local function main()
             elseif event == "peripheral_detach" then
                 if p1 == reactorSide then
                     unbindReactor("peripheral_detach on side " .. tostring(p1))
+                end
+            elseif event == "mouse_click" and p1 == 1 then
+                -- Navigation-only - see "VISUAL DASHBOARD / DESKTOP SHELL"
+                -- header comment. No branch here ever calls a reactor
+                -- action function.
+                local x, y = p2, p3
+                if currentScreen == "desktop" then
+                    local key = os_shell.hitTestIcons(lastDesktopIcons, x, y)
+                    if key == "update" then
+                        launchUpdater()
+                    elseif key == "scada" or key == "settings" or key == "network" then
+                        currentScreen = key
+                        safeDraw()
+                    end
+                elseif homeHitRegion and os_shell.isHomeClick(x, y) then
+                    currentScreen = "desktop"
+                    safeDraw()
                 end
             end
         end)

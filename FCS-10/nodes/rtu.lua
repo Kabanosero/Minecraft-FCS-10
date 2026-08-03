@@ -74,6 +74,12 @@ if not okSn then
     return
 end
 
+local okShell, os_shell = pcall(dofile, "/lib/os_shell.lua")
+if not okShell then
+    print("[RTU] FATAL: failed to load /lib/os_shell.lua: " .. tostring(os_shell))
+    return
+end
+
 local NET    = config.NETWORK
 local MSG    = config.NETWORK.MSG_TYPE
 local STATES = config.STATES
@@ -91,20 +97,30 @@ rtuState.fuelPct = 0 -- RTU-specific extension field, not part of the SSOT shape
 
 local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
 
+-- currentScreen drives ONLY which draw function runs and where mouse_click
+-- is routed - see "VISUAL DASHBOARD / DESKTOP SHELL" below. It has zero
+-- effect on the poll/broadcast logic above.
+local currentScreen    = "desktop" -- "desktop" | "scada" | "settings" | "network"
+local lastDesktopIcons = {}        -- laid-out icon hit-regions from the last drawDesktopScreen()
+
 -- ===========================================================================
--- VISUAL DASHBOARD - a single, continuously-redrawn status screen, same
--- move nodes/hmi.lua/supervisor.lua/nodes/plc.lua already made away from a
--- plain print() scroll. Every print() call site below this point is
+-- VISUAL DASHBOARD / DESKTOP SHELL - a continuously-redrawn, screen-based UI
+-- built on lib/os_shell.lua's shared boot-splash/desktop/chrome helpers,
+-- same move nodes/hmi.lua/supervisor.lua/nodes/plc.lua already made away
+-- from a plain print() scroll. Every print() call site below this point is
 -- replaced with logLine() instead - print() writes at the shell cursor and
 -- scrolls the terminal on overflow, which would tear up this drawn screen
 -- exactly the way nodes/hmi.lua's own STATUS CONSOLE comment already
--- documents for that file. The two print()s ABOVE this point (config/secnet
--- FATAL) are deliberately left as raw prints: they happen during the plain
--- boot scroll before the first draw() below wipes the screen clean.
+-- documents for that file. The two print()s ABOVE this point (config/secnet/
+-- os_shell FATAL) are deliberately left as raw prints: they happen during
+-- the plain boot scroll before the first draw() below wipes the screen
+-- clean.
 --
--- Read-only - no mouse_click handling. This node has no actuator and no
--- command handling (see header "WHY NO WATCHDOG / NO COMMAND HANDLING") -
--- there is nothing for an on-screen control to do.
+-- INTERACTIVE, but navigation-only, same as nodes/plc.lua: clicking desktop
+-- icons or the HOME button only changes currentScreen. This node has no
+-- actuator and no command handling (see header "WHY NO WATCHDOG / NO
+-- COMMAND HANDLING") - there is still nothing for an on-screen control to
+-- do beyond navigation and the UPDATE icon's installer.lua shell-out.
 -- ===========================================================================
 local LOG_LINES = 6
 local uiLog = {}
@@ -134,15 +150,16 @@ local STATE_COLOR = {
     [STATES.ANOMALY] = colors.orange,
 }
 
-local function draw()
+local homeHitRegion = nil -- HOME button hit-region from the last sub-screen chrome draw
+
+local function drawScadaScreen()
     local w, h = term.getSize()
 
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
     term.clear()
 
-    term.setCursorPos(1, 1)
-    term.write(("FCS-10 RTU #%d"):format(os.getComputerID()))
+    homeHitRegion = os_shell.drawScreenHeader(("SCADA - RTU #%d"):format(os.getComputerID()))
 
     term.setCursorPos(1, 2)
     term.setBackgroundColor(STATE_COLOR[rtuState.plantState] or colors.gray)
@@ -187,6 +204,74 @@ local function draw()
     end
 end
 
+-- Desktop icons - "SCADA" is this node's core telemetry screen (the
+-- function above); SETTINGS/NETWORK are read-only info screens; UPDATE
+-- isn't a screen at all, see launchUpdater() below.
+local DESKTOP_ICONS = {
+    { key = "scada",    label = "SCADA",    color = colors.orange },
+    { key = "settings", label = "SETTINGS", color = colors.gray },
+    { key = "network",  label = "NETWORK",  color = colors.cyan },
+    { key = "update",   label = "UPDATE",   color = colors.blue },
+}
+
+local function drawDesktopScreen()
+    lastDesktopIcons = os_shell.drawDesktop({
+        title       = ("FCS-10 RTU #%d"):format(os.getComputerID()),
+        statusRight = ("STATE: %s"):format(rtuState.plantState),
+        statusColor = STATE_COLOR[rtuState.plantState] or colors.white,
+        icons       = DESKTOP_ICONS,
+        footer      = "Click an icon to launch a program.",
+    })
+end
+
+local function drawSettingsScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    homeHitRegion = os_shell.drawScreenHeader("SETTINGS")
+    os_shell.drawKeyValueList({
+        { label = "Role",        value = "RTU (monitor-only)" },
+        { label = "Computer ID", value = os.getComputerID() },
+        { label = "Reactor HW",  value = peripheralPresent and "PRESENT" or "ABSENT",
+          color = peripheralPresent and colors.green or colors.red },
+        { label = "Plant state", value = rtuState.plantState,
+          color = STATE_COLOR[rtuState.plantState] or colors.white },
+        { label = "Trip authority", value = "NONE - see nodes/plc.lua" },
+    }, 3)
+end
+
+local function drawNetworkScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    homeHitRegion = os_shell.drawScreenHeader("NETWORK")
+    local ageText = rtuState.lastUpdate > 0
+        and fmtAge(os.epoch("utc") - rtuState.lastUpdate) or "--"
+    os_shell.drawKeyValueList({
+        { label = "secnet",           value = secnetOpen and "OPEN" or "NOT OPEN",
+          color = secnetOpen and colors.green or colors.red },
+        { label = "Hosts on",         value = NET.PROTOCOL_RTU },
+        { label = "Sends to",         value = NET.PROTOCOL_SUPERVISOR },
+        { label = "Last reading age", value = ageText },
+        { label = "Heartbeat every",  value = NET.HEARTBEAT_INTERVAL_S .. "s" },
+    }, 3)
+end
+
+-- Single dispatch point every draw call site below goes through - which
+-- screen function actually runs depends only on currentScreen, a purely
+-- local display choice with no effect on the poll/broadcast logic above.
+local function draw()
+    if currentScreen == "scada" then
+        drawScadaScreen()
+    elseif currentScreen == "settings" then
+        drawSettingsScreen()
+    elseif currentScreen == "network" then
+        drawNetworkScreen()
+    else
+        drawDesktopScreen()
+    end
+end
+
 -- Dedicated pcall boundary, same reasoning as supervisor.lua's safeRedraw()/
 -- plc.lua's safeDraw(): drawing must never be allowed to kill this node's
 -- main loop.
@@ -195,6 +280,22 @@ local function safeDraw()
     if not ok then
         print("[RTU] draw failed (non-fatal): " .. tostring(err))
     end
+end
+
+-- Shells out to the existing installer.lua (see nodes/plc.lua's
+-- launchUpdater() for the full reasoning - identical here, just targeting
+-- role "rtu"). This node has no trip authority to pause, unlike the PLC,
+-- but its telemetry polling does pause for the duration - logged clearly
+-- before launching for the same honesty reasons.
+local function launchUpdater()
+    logLine("UPDATE: opening installer - telemetry polling pauses until it returns")
+    safeDraw()
+    pcall(function()
+        shell.run("/installer.lua", "update", "rtu")
+        os.sleep(2) -- brief, bounded pause so the printed result is readable, never indefinite
+    end)
+    logLine("UPDATE: installer closed, resuming normal operation")
+    safeDraw()
 end
 
 -- secnet.open()'s only failure mode is "no modem found this call" (see
@@ -352,6 +453,17 @@ end
 -- never sleep(), never an un-yielded while true.
 -- ===========================================================================
 local function main()
+    -- One-time boot splash, before the main loop starts - see nodes/plc.lua
+    -- for the identical reasoning. Purely cosmetic and non-blocking on its
+    -- own; the fixed os.sleep() is what holds it on screen briefly.
+    os_shell.drawBootSplash({
+        title    = "FCS-10",
+        subtitle = "Zone RTU (monitor-only)",
+        role     = "RTU",
+        accent   = colors.orange,
+    })
+    os.sleep(1.2)
+
     -- Logged (not printed) before anything else runs, so it's already the
     -- oldest entry in the log panel by the time the first draw() happens.
     logLine("FCS-10 Zone RTU booting on computer #" .. os.getComputerID())
@@ -379,7 +491,7 @@ local function main()
     -- trigger it into (see header).
 
     while true do
-        local event, p1, p2 = os.pullEvent() -- yields every iteration; never a busy-spin
+        local event, p1, p2, p3 = os.pullEvent() -- yields every iteration; never a busy-spin
 
         -- Outer per-iteration pcall: same last line of defense plc.lua and
         -- supervisor.lua use - an unanticipated bug here must never kill
@@ -407,6 +519,22 @@ local function main()
             elseif event == "peripheral_detach" then
                 if p1 == reactorSide then
                     unbindReactor("peripheral_detach on side " .. tostring(p1))
+                end
+            elseif event == "mouse_click" and p1 == 1 then
+                -- Navigation-only, same as nodes/plc.lua - no branch here
+                -- ever issues a reactor action (this node has none to issue).
+                local x, y = p2, p3
+                if currentScreen == "desktop" then
+                    local key = os_shell.hitTestIcons(lastDesktopIcons, x, y)
+                    if key == "update" then
+                        launchUpdater()
+                    elseif key == "scada" or key == "settings" or key == "network" then
+                        currentScreen = key
+                        safeDraw()
+                    end
+                elseif homeHitRegion and os_shell.isHomeClick(x, y) then
+                    currentScreen = "desktop"
+                    safeDraw()
                 end
             end
         end)

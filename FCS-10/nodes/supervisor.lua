@@ -62,6 +62,12 @@ if not okSn then
     return
 end
 
+local okShell, os_shell = pcall(dofile, "/lib/os_shell.lua")
+if not okShell then
+    print("[SUP] FATAL: failed to load /lib/os_shell.lua: " .. tostring(os_shell))
+    return
+end
+
 local NET    = config.NETWORK
 local MSG    = config.NETWORK.MSG_TYPE
 local SP     = config.SETPOINTS
@@ -163,6 +169,14 @@ local lastRenderedTabs      = {} -- tab bar bounds, same capture pattern as last
 -- screen is "is everything OK overall", not "show me every PLC row" -
 -- matches aggregateStatus()'s own role as the single system-wide verdict.
 local currentTab = "SVR"
+
+-- currentScreen drives ONLY which top-level screen function runs and where
+-- mouse_click is routed - see "DESKTOP SHELL" below. "console" is this
+-- file's existing SVR/PLC/RTU tabbed view (currentTab, above, picks the
+-- tab within it); it has zero effect on the telemetry/command logic.
+local currentScreen    = "desktop" -- "desktop" | "console" | "settings" | "network"
+local lastDesktopIcons = {}        -- laid-out icon hit-regions from the last drawDesktopScreen()
+local homeHitRegion    = nil       -- HOME button hit-region from the last Settings/Network chrome draw
 
 local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
 
@@ -709,9 +723,23 @@ end
 -- ---------------------------------------------------------------------------
 local TABS = { "SVR", "PLC", "RTU" }
 
+-- Prepended to the tab bar as a distinct, non-TABS entry (id "__HOME__") so
+-- there's a way back out to the desktop shell without disturbing the
+-- existing SVR/PLC/RTU tab-switch logic, which only ever needs to
+-- recognize real TABS ids.
+local HOME_TAB_LABEL = " <HOME "
+
 local function drawTabBar(w)
     lastRenderedTabs = {}
     local x = 1
+
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.lightBlue)
+    term.setCursorPos(x, 2)
+    term.write(HOME_TAB_LABEL)
+    lastRenderedTabs[#lastRenderedTabs + 1] = { id = "__HOME__", x = x, y = 2, width = #HOME_TAB_LABEL }
+    x = x + #HOME_TAB_LABEL
+
     for _, tab in ipairs(TABS) do
         local label = " " .. tab .. " "
         if tab == currentTab then
@@ -950,19 +978,10 @@ local function drawRoleTab(h, predicate, showButtons)
     end
 end
 
--- Full clear + redraw-everything each tick: simplest, most robust choice
--- at a 1Hz cadence on a small CC terminal - no differential rendering.
--- Rows longer than the terminal width are simply clipped by term.write
--- itself (CC terminals don't auto-wrap on write), which is why there is no
--- separate column-dropping logic here: on a narrow terminal the trailing
--- columns (burn rate, age) are what naturally disappear first.
-local function redraw()
-    local w, h = term.getSize()
-
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
-
+-- The pre-existing SVR/PLC/RTU tabbed view, now one of four top-level
+-- screens (see "DESKTOP SHELL" below) rather than the only thing this file
+-- ever draws. Body unchanged from the original redraw().
+local function drawConsoleScreen(w, h)
     term.setCursorPos(1, 1)
     term.write(("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()))
 
@@ -977,6 +996,123 @@ local function redraw()
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- DESKTOP SHELL - built on lib/os_shell.lua's shared boot-splash/desktop/
+-- chrome helpers, same move nodes/plc.lua/nodes/rtu.lua make. CONSOLE (the
+-- function above) is this node's core operator screen; SETTINGS/NETWORK are
+-- read-only info screens; UPDATE isn't a screen at all, see launchUpdater().
+-- ---------------------------------------------------------------------------
+local DESKTOP_ICONS = {
+    { key = "console",  label = "CONSOLE",  color = colors.lightBlue },
+    { key = "settings", label = "SETTINGS", color = colors.gray },
+    { key = "network",  label = "NETWORK",  color = colors.cyan },
+    { key = "update",   label = "UPDATE",   color = colors.blue },
+}
+
+local function drawDesktopScreen()
+    local status = aggregateStatus()
+    lastDesktopIcons = os_shell.drawDesktop({
+        title       = ("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()),
+        statusRight = ("SYSTEM: %s"):format(status),
+        statusColor = STATUS_COLOR[status] or colors.white,
+        icons       = DESKTOP_ICONS,
+        footer      = "Click an icon to launch a program.",
+    })
+end
+
+local function drawSettingsScreen()
+    homeHitRegion = os_shell.drawScreenHeader("SETTINGS")
+
+    local plcCount, rtuCount = 0, 0
+    for _, rec in pairs(plcs) do
+        if rec.role == "RTU" then
+            rtuCount = rtuCount + 1
+        else
+            plcCount = plcCount + 1
+        end
+    end
+
+    local status = aggregateStatus()
+    os_shell.drawKeyValueList({
+        { label = "Role",          value = "SUPERVISOR" },
+        { label = "Computer ID",   value = os.getComputerID() },
+        { label = "System status", value = status, color = STATUS_COLOR[status] or colors.white },
+        { label = "Known PLCs",    value = plcCount },
+        { label = "Known RTUs",    value = rtuCount },
+        { label = "Last command",  value = formatCommandStatus(lastCommandRef) },
+    }, 3)
+end
+
+local function drawNetworkScreen()
+    homeHitRegion = os_shell.drawScreenHeader("NETWORK")
+    os_shell.drawKeyValueList({
+        { label = "secnet",     value = secnetOpen and "OPEN" or "NOT OPEN",
+          color = secnetOpen and colors.green or colors.red },
+        { label = "Hosts on",   value = NET.PROTOCOL_SUPERVISOR },
+        { label = "Sends to",   value = NET.PROTOCOL_PLC },
+        { label = "HB sent",    value = fmtAge(os.epoch("utc") - lastHeartbeatSentAt) .. " ago" },
+        { label = "HB cadence", value = NET.HEARTBEAT_INTERVAL_S .. "s" },
+    }, 3)
+
+    -- Peer list - unlike plc.lua/rtu.lua's Network screens, this node
+    -- actually tracks one (the `plcs` table), so it's worth showing here.
+    local _, h = term.getSize()
+    local row = 10
+    if row <= h then
+        term.setTextColor(colors.gray)
+        term.setCursorPos(2, row)
+        term.write("Known peers:")
+        term.setTextColor(colors.white)
+        row = row + 1
+    end
+
+    local ids = {}
+    for plcId in pairs(plcs) do
+        ids[#ids + 1] = plcId
+    end
+    table.sort(ids)
+
+    for _, plcId in ipairs(ids) do
+        if row > h then
+            break
+        end
+        local rec = plcs[plcId]
+        local online = isOnline(rec)
+        term.setCursorPos(2, row)
+        term.setTextColor(online and colors.white or colors.orange)
+        term.write(("%s#%-3d %-4s %s"):format(
+            rec.role == "RTU" and "R" or " ", plcId, rec.role or "?", online and "online" or "offline"))
+        row = row + 1
+    end
+    term.setTextColor(colors.white)
+end
+
+-- Full clear + redraw-everything each tick: simplest, most robust choice
+-- at a 1Hz cadence on a small CC terminal - no differential rendering.
+-- Rows longer than the terminal width are simply clipped by term.write
+-- itself (CC terminals don't auto-wrap on write), which is why there is no
+-- separate column-dropping logic here: on a narrow terminal the trailing
+-- columns (burn rate, age) are what naturally disappear first. Which
+-- screen function actually runs depends only on currentScreen, a purely
+-- local display choice with no effect on the telemetry/command logic above.
+local function redraw()
+    local w, h = term.getSize()
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+
+    if currentScreen == "console" then
+        drawConsoleScreen(w, h)
+    elseif currentScreen == "settings" then
+        drawSettingsScreen()
+    elseif currentScreen == "network" then
+        drawNetworkScreen()
+    else
+        drawDesktopScreen()
+    end
+end
+
 -- The one dedicated pcall boundary beyond the outer per-iteration one (see
 -- main()) - added for diagnostic clarity, since redraw() is the one code
 -- path here with no equivalent in plc.lua and the most surface area for a
@@ -988,12 +1124,42 @@ local function safeRedraw()
     end
 end
 
+-- Shells out to the existing installer.lua (see nodes/plc.lua's
+-- launchUpdater() for the full reasoning - identical here, just targeting
+-- role "supervisor" and using print()/safeRedraw() instead of logLine()/
+-- safeDraw(), matching this file's own existing logging convention. Every
+-- PLC's own watchdog fail-safe SCRAMs if it hears nothing from this node for
+-- HEARTBEAT_TIMEOUT_S - shell.run() blocking this loop for the duration is
+-- the fail-safe correctly doing its job if that happens, not a bug, which is
+-- why this is clearly logged before launching rather than silently swallowed.
+local function launchUpdater()
+    print("[SUP] UPDATE: opening installer - this console pauses until it returns")
+    safeRedraw()
+    pcall(function()
+        shell.run("/installer.lua", "update", "supervisor")
+        os.sleep(2) -- brief, bounded pause so the printed result is readable, never indefinite
+    end)
+    print("[SUP] UPDATE: installer closed, resuming normal operation")
+    safeRedraw()
+end
+
 -- ---------------------------------------------------------------------------
 -- Main event loop - strictly non-blocking, same pattern as plc.lua: a
 -- single os.pullEvent() wait per iteration, os.startTimer()-driven
 -- cadences, one outer per-iteration pcall as the last line of defense.
 -- ---------------------------------------------------------------------------
 local function main()
+    -- One-time boot splash, before the main loop starts - see nodes/plc.lua
+    -- for the identical reasoning. Purely cosmetic and non-blocking on its
+    -- own; the fixed os.sleep() is what holds it on screen briefly.
+    os_shell.drawBootSplash({
+        title    = "FCS-10",
+        subtitle = "Central Supervisor",
+        role     = "SUPERVISOR",
+        accent   = colors.lightBlue,
+    })
+    os.sleep(1.2)
+
     print("[SUP] FCS-10 Supervisor booting on computer #" .. os.getComputerID())
 
     local okOpen, openErr = tryOpenSecnet()
@@ -1074,30 +1240,47 @@ local function main()
             elseif event == "mouse_click" then
                 local button, x, y = p1, p2, p3
                 if button == 1 then -- left-click only, same guard installer.lua's wizard uses for consequential actions
-                    local tabBtn = hitTestButtons(lastRenderedTabs, x, y)
-                    if tabBtn then
-                        -- Selection is cleared on tab switch rather than
-                        -- carried across: a stale selectedPlcId pointing at
-                        -- a row from the tab just left (or one that isn't
-                        -- even shown on the new tab) is more confusing than
-                        -- just asking the operator to reselect.
-                        currentTab = tabBtn.id
-                        selectedPlcId = nil
-                    else
-                        local btn = hitTestButtons(lastRenderedButtons, x, y)
-                        if btn then
-                            if selectedPlcId then
-                                if btn.id == "scram" then
-                                    sendScramCommand(selectedPlcId)
-                                elseif btn.id == "open_bypass" then
-                                    sendOpenBypassCommand(selectedPlcId)
-                                elseif btn.id == "close_bypass" then
-                                    sendCloseBypassCommand(selectedPlcId)
-                                end
-                            end
-                        elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
-                            selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
+                    if currentScreen == "desktop" then
+                        local key = os_shell.hitTestIcons(lastDesktopIcons, x, y)
+                        if key == "update" then
+                            launchUpdater()
+                        elseif key == "console" or key == "settings" or key == "network" then
+                            currentScreen = key
                         end
+                    elseif currentScreen == "console" then
+                        local tabBtn = hitTestButtons(lastRenderedTabs, x, y)
+                        if tabBtn then
+                            if tabBtn.id == "__HOME__" then
+                                currentScreen = "desktop"
+                            else
+                                -- Selection is cleared on tab switch rather
+                                -- than carried across: a stale selectedPlcId
+                                -- pointing at a row from the tab just left
+                                -- (or one that isn't even shown on the new
+                                -- tab) is more confusing than just asking
+                                -- the operator to reselect.
+                                currentTab = tabBtn.id
+                                selectedPlcId = nil
+                            end
+                        else
+                            local btn = hitTestButtons(lastRenderedButtons, x, y)
+                            if btn then
+                                if selectedPlcId then
+                                    if btn.id == "scram" then
+                                        sendScramCommand(selectedPlcId)
+                                    elseif btn.id == "open_bypass" then
+                                        sendOpenBypassCommand(selectedPlcId)
+                                    elseif btn.id == "close_bypass" then
+                                        sendCloseBypassCommand(selectedPlcId)
+                                    end
+                                end
+                            elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
+                                selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
+                            end
+                        end
+                    elseif homeHitRegion and os_shell.isHomeClick(x, y) then
+                        -- settings/network screens
+                        currentScreen = "desktop"
                     end
                     safeRedraw()
                 end

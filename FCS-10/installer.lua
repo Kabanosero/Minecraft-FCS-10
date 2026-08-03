@@ -20,6 +20,7 @@ local COMMON_FILES = {
     "lib/config.lua",
     "lib/md5.lua",
     "lib/secnet.lua",
+    "lib/os_shell.lua",
 }
 
 local ROLE_FILES = {
