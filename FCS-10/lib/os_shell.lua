@@ -24,31 +24,34 @@
 -- so a node switching to "Settings" or "Network" never pauses its own
 -- os.pullEvent() loop or the timer-driven poll/broadcast logic inside it.
 --
--- BOX-DRAWING CHARACTERS: CC:Tweaked's terminal font follows the classic
--- CP437 layout for byte values 128-255, which is where every line/border
--- glyph used below lives - written via string.char(<code>), NOT the UTF-8
--- box-drawing characters (those are 3-byte sequences that would render as
--- 3 wrong glyphs on a CP437-mapped single-byte terminal font).
+-- BORDER CHARACTERS: plain 7-bit ASCII only (+, -, |, =). An earlier version
+-- of this file used string.char() with CP437 code points on the assumption
+-- that CC:Tweaked's terminal font follows the classic IBM CP437 layout for
+-- byte values 128-255 - it does not (those bytes render as Latin-1/CP1252
+-- accented letters instead, confirmed against an actual in-game screenshot).
+-- Plain ASCII is guaranteed to render identically regardless of font/
+-- charset, at the cost of a less fancy-looking border than true box-drawing
+-- glyphs would give.
 
 local os_shell = {}
 
--- CP437 code points - single-line (S*) for small elements (icon buttons),
--- double-line (unprefixed) for full-screen panel frames, matching a real
--- control-room console's mix of a heavy outer bezel and lighter inset
--- controls.
+-- Single-line (S*) for small elements (icon buttons), double-line
+-- (unprefixed, using "=" instead of "-") for full-screen panel frames -
+-- still gives a visually heavier outer bezel vs. lighter inset controls
+-- even without real box-drawing glyphs.
 local CH = {
-    h   = string.char(205), -- ═
-    v   = string.char(186), -- ║
-    tl  = string.char(201), -- ╔
-    tr  = string.char(187), -- ╗
-    bl  = string.char(200), -- ╚
-    br  = string.char(188), -- ╝
-    Sh  = string.char(196), -- ─
-    Sv  = string.char(179), -- │
-    Stl = string.char(218), -- ┌
-    Str = string.char(191), -- ┐
-    Sbl = string.char(192), -- └
-    Sbr = string.char(217), -- ┘
+    h   = "=",
+    v   = "|",
+    tl  = "+",
+    tr  = "+",
+    bl  = "+",
+    br  = "+",
+    Sh  = "-",
+    Sv  = "|",
+    Stl = "+",
+    Str = "+",
+    Sbl = "+",
+    Sbr = "+",
 }
 
 -- ---------------------------------------------------------------------------
