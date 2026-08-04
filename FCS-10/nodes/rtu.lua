@@ -849,21 +849,32 @@ end
 -- the existing `state = rtuState` TELEMETRY broadcast, no separate payload
 -- field needed (see rtuState.aux's own declaration comment above).
 --
--- GHOST-MACHINE FIX: most of these Mekanism machines are multiblock
--- structures - the wrapped peripheral lives on one "port" block, and
--- removing some OTHER block of the structure (or the whole machine minus
--- that port) unforms the multiblock without ever detaching the port block
--- itself. No "peripheral_detach" event fires for that, so
--- unregisterUnit() (only called from that event, see main()) never runs,
--- and the unit would otherwise sit in detectedUnits/aux forever showing
--- blank/stale fields - exactly the "still displaying after removal"
--- symptom this was fixed for. Mekanism's own getters throw once a
--- multiblock is unformed, so a poll where EVERY getter fails (pollUnitFields
--- returns any=false) is treated as equivalent to a detach and unregistered
--- here, same as tryBindReactor/unbindReactor already does for the reactor
--- itself. Collected into `dead` and unregistered after the loops below
--- (rather than inline) so this stays simple to read even though Lua does
--- in fact permit nil-ing the current key mid-pairs() traversal.
+-- GHOST-MACHINE FIX: relying solely on the "peripheral_detach" event (see
+-- main()) turned out not to be enough - confirmed in-game against a
+-- removed Solar Neutron Activator, which kept showing a SNA row with every
+-- displayed field blank (in/out/sun all nil) instead of disappearing.
+-- peripheral.isPresent(name) is CC:Tweaked's own live reachability check
+-- (the same source of truth "peripheral_detach" is derived from) rather
+-- than something cached from an event that may simply not have fired for
+-- this name/topology - checking it explicitly here, every poll, is a
+-- strictly stronger guarantee than "wait for the event" alone, matching
+-- this codebase's existing "retry every tick + on event, never trust the
+-- event alone" pattern (see tryBindReactor/tryOpenSecnet). A unit failing
+-- isPresent is dead immediately, no getters even attempted.
+--
+-- Kept as a second line of defense (not the only check): a multiblock
+-- machine (Turbine/SPS/Induction Matrix/etc) can also still be
+-- isPresent()==true - the port block is physically there - while some
+-- OTHER structure block is missing and the multiblock itself is unformed.
+-- Mekanism's own getters are inconsistent about that case: some throw,
+-- but others (observed on the SNA above) silently return a stale/cached
+-- value instead of erroring, which is exactly why isPresent() had to be
+-- added rather than trusting pollUnitFields' any=false alone. Both checks
+-- stay, since neither alone covers both failure modes.
+--
+-- Collected into `dead` and unregistered after the loops below (rather
+-- than inline) so this stays simple to read even though Lua does in fact
+-- permit nil-ing the current key mid-pairs() traversal.
 local function pollAuxUnits()
     local aux = rtuState.aux
     local dead = {}
@@ -886,6 +897,11 @@ local function pollAuxUnits()
     end
 
     local function poll(name, handle, fieldMap, out)
+        local okPresent, present = pcall(peripheral.isPresent, name)
+        if okPresent and not present then
+            dead[#dead + 1] = name
+            return
+        end
         local fields, any = pollUnitFields(handle, fieldMap)
         if any then
             out[name] = fields

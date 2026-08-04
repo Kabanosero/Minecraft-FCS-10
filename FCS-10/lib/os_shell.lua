@@ -3,11 +3,17 @@
 -- desktop icon launcher, and small reusable screen furniture (a header bar
 -- with a HOME button, a key/value info-row renderer, and a panel frame) -
 -- the pieces every node's own desktop/Settings/Network screens are built
--- from. Styled as an industrial control-room panel (double-line borders,
--- bordered "keycap" buttons, a hazard-stripe boot accent) rather than a
--- flat modern-app look, to match the reactor-protection-system theme
--- already established across this project's comments (NUREG-1433/IAEA
--- SSG-76 references, LOTO, EAL tiers).
+-- from. The desktop (drawDesktop, below) is styled as a simplified
+-- Windows-7-like desktop - a colored wallpaper fill, borderless icon+
+-- caption tiles, and a bottom taskbar with a Start-style badge, title,
+-- status chip, and clock - while the sub-screen furniture (drawScreenHeader/
+-- drawScreenFrame/drawKeyValueList/drawThemeButton, and every node's own
+-- SCADA/Settings/Network/Console body) still uses the original industrial
+-- control-room panel look (double-line borders, hazard-stripe boot accent)
+-- to match the reactor-protection-system theme already established across
+-- this project's comments (NUREG-1433/IAEA SSG-76 references, LOTO, EAL
+-- tiers). That split is deliberate, not an inconsistency left behind: the
+-- desktop got its reskin first, the sub-screens are a separate follow-up.
 --
 -- Pure rendering + hit-testing only. Never touches rednet/reactor state and
 -- never blocks or sleeps, so it cannot delay a node's own control loop by
@@ -35,37 +41,32 @@
 
 local os_shell = {}
 
--- Single-line (S*) for small elements (icon buttons), double-line
--- (unprefixed, using "=" instead of "-") for full-screen panel frames -
--- still gives a visually heavier outer bezel vs. lighter inset controls
--- even without real box-drawing glyphs.
+-- Double-line (using "=" for the horizontal rule) full-screen panel frame
+-- glyphs, used by drawBootSplash and the sub-screen header/frame furniture
+-- below - still gives a visually heavier bezel even without real box-
+-- drawing glyphs. The desktop no longer uses any of these (see drawDesktop
+-- below - it's borderless, wallpaper edge-to-edge).
 local CH = {
-    h   = "=",
-    v   = "|",
-    tl  = "+",
-    tr  = "+",
-    bl  = "+",
-    br  = "+",
-    Sh  = "-",
-    Sv  = "|",
-    Stl = "+",
-    Str = "+",
-    Sbl = "+",
-    Sbr = "+",
+    h  = "=",
+    v  = "|",
+    tl = "+",
+    tr = "+",
+    bl = "+",
+    br = "+",
 }
 
 -- ---------------------------------------------------------------------------
--- THEMING - two named palettes, switchable at runtime via cycleTheme(). A
--- real settings control (drawThemeButton, below) is the intended way to
--- reach it, not something a node hardcodes. btnSafe/btnDanger/btnNeutral
--- are semantic action colors (green=safe, red=danger) and stay identical
--- across both palettes on purpose - a cosmetic theme switch must never
--- change what "danger" looks like, only what the background/chrome looks
--- like. "mono" is the pre-existing black-on-white look every node already
--- shipped with, kept as the default so a fresh install's first boot is
--- visually unchanged; "classic" is the lighter alternative (named to match
--- nodes/hmi.lua's own pre-existing theme table, which this module now
--- supersedes - see that file for the migration).
+-- THEMING - one active palette, read fresh by every draw function below
+-- (never cached), still switchable via cycleTheme()/drawThemeButton for
+-- whenever a second look gets added back. btnSafe/btnDanger/btnNeutral are
+-- semantic action colors (green=safe, red=danger) that must never change
+-- with a cosmetic theme switch. "classic" (a lighter alternative palette)
+-- was dropped when the desktop got its Windows-7-style reskin below - every
+-- OTHER field here keeps its original "mono" value unchanged on purpose, so
+-- the not-yet-redesigned Settings/Network/SCADA/Console screens (which read
+-- these directly) stay pixel-identical; only the 6 new desktop-only fields
+-- at the bottom are new. THEME_ORDER having a single entry makes
+-- cycleTheme() an intentional no-op for now, not a bug.
 -- ---------------------------------------------------------------------------
 os_shell.THEMES = {
     mono = {
@@ -83,22 +84,22 @@ os_shell.THEMES = {
         btnSafe   = colors.green,
         btnDanger = colors.red,
         btnNeutral = colors.lightBlue,
-    },
-    classic = {
-        bg        = colors.lightGray,
-        text      = colors.black,
-        barBg     = colors.gray,
-        barText   = colors.white,
-        iconText  = colors.black,
-        accent    = colors.blue,
-        dim       = colors.gray,
-        frame     = colors.gray,
-        btnSafe   = colors.green,
-        btnDanger = colors.red,
-        btnNeutral = colors.blue,
+
+        -- Desktop-only (drawDesktop/layoutIcons/drawIconTile/drawTaskbar) -
+        -- nothing else in this module or any node's other screens reads
+        -- these. taskbarBg is black rather than gray on purpose: Supervisor's
+        -- STATUS_COLOR["AWAITING PLC"] = colors.gray would render invisibly
+        -- on a gray bar; black preserves the exact contrast every status
+        -- color already has today against theme.bg.
+        wallpaperBg    = colors.blue,
+        taskbarBg      = colors.black,
+        taskbarText    = colors.white,
+        startBadgeBg   = colors.lightBlue,
+        startBadgeText = colors.white,
+        clockText      = colors.lightGray,
     },
 }
-os_shell.THEME_ORDER = { "mono", "classic" }
+os_shell.THEME_ORDER = { "mono" }
 
 local currentThemeName = "mono"
 os_shell.THEME = os_shell.THEMES[currentThemeName]
@@ -197,10 +198,14 @@ end
 -- current terminal, top-anchored at row `top`. Mutates and returns the same
 -- list with x/y/w/h filled in - drawDesktop feeds its result straight into
 -- hitTestIcons so draw and hit-test can never disagree about where an icon
--- actually is, since they're never computed twice.
-local ICON_W, ICON_H = 12, 3
+-- actually is, since they're never computed twice. Driven purely by
+-- terminal width/icon count, not hardcoded to today's icon lists, so it
+-- scales automatically if a node ever adds more icons.
+local ICON_W, ICON_H   = 9, 3   -- tile: 9 cols wide, 3 rows tall (2-row glyph + 1 caption row)
+local GLYPH_W, GLYPH_H = 5, 2   -- solid-color glyph rectangle, centered within the tile
+local GUTTER_MIN       = 1
 local function layoutIcons(icons, w, top)
-    local cols = math.max(1, math.floor(w / (ICON_W + 2)))
+    local cols = math.max(1, math.floor(w / (ICON_W + GUTTER_MIN)))
     local gutterX = math.max(1, math.floor((w - cols * ICON_W) / (cols + 1)))
     for i, icon in ipairs(icons) do
         local col = (i - 1) % cols
@@ -213,92 +218,126 @@ local function layoutIcons(icons, w, top)
     return icons
 end
 
--- Draws one icon as a single-line-bordered "keycap" button (border in the
--- icon's own accent color, black interior, label centered on the middle
--- row) rather than a flat filled tile - reads as a physical control-panel
--- pushbutton instead of a phone-home-screen icon.
-local function drawIconButton(icon, theme)
+-- Draws one icon as a borderless desktop tile: a solid-color glyph
+-- rectangle (built from background-colored spaces - the same zero-font-
+-- risk technique drawBootSplash's hazard stripe already uses, no ASCII
+-- border glyphs at all) with the caption centered directly beneath it -
+-- reads as a real desktop icon+label pair rather than a control-panel
+-- pushbutton.
+local function drawIconTile(icon, theme)
     local c = icon.color or theme.accent
-    term.setBackgroundColor(theme.bg)
-    term.setTextColor(c)
-    term.setCursorPos(icon.x, icon.y)
-    term.write(CH.Stl .. string.rep(CH.Sh, icon.w - 2) .. CH.Str)
+    local glyphX = icon.x + math.floor((icon.w - GLYPH_W) / 2)
+
+    term.setBackgroundColor(c)
+    for row = 0, GLYPH_H - 1 do
+        term.setCursorPos(glyphX, icon.y + row)
+        term.write(string.rep(" ", GLYPH_W))
+    end
 
     local label = icon.label or icon.key
-    if #label > icon.w - 2 then
-        label = label:sub(1, icon.w - 2)
+    if #label > icon.w then
+        label = label:sub(1, icon.w)
     end
-    term.setCursorPos(icon.x, icon.y + 1)
-    term.write(CH.Sv)
+    term.setBackgroundColor(theme.wallpaperBg)
     term.setTextColor(theme.iconText)
-    term.setCursorPos(icon.x + 1 + math.max(0, math.floor((icon.w - 2 - #label) / 2)), icon.y + 1)
+    term.setCursorPos(icon.x + math.max(0, math.floor((icon.w - #label) / 2)), icon.y + GLYPH_H)
     term.write(label)
-    term.setTextColor(c)
-    term.setCursorPos(icon.x + icon.w - 1, icon.y + 1)
-    term.write(CH.Sv)
+end
 
-    term.setCursorPos(icon.x, icon.y + 2)
-    term.write(CH.Sbl .. string.rep(CH.Sh, icon.w - 2) .. CH.Sbr)
+local BADGE_TEXT = "FCS-10"
+local CLOCK_FMT, CLOCK_W = "%H:%M:%S", 8
+
+-- os.date is unused anywhere else in this codebase (CC:Tweaked documents it
+-- as mirroring standard Lua os.date, but that's never been proven in-game
+-- for this project) - guarded and pcall'd per this module's own "never
+-- assert an unverified engine fact" rule (see the CP437 lesson in this
+-- file's header). Falls back to an os.epoch("utc")-derived clock (a real-
+-- world-ms source already proven throughout this codebase, e.g.
+-- lib/secnet.lua) if os.date is ever missing or misbehaves - note the
+-- fallback reads UTC, not local time, a cosmetic difference only.
+local function clockText()
+    local ok, text = pcall(os.date, CLOCK_FMT)
+    if ok and type(text) == "string" and #text == CLOCK_W then
+        return text
+    end
+    local s = math.floor(os.epoch("utc") / 1000) % 86400
+    return string.format("%02d:%02d:%02d", math.floor(s / 3600), math.floor((s % 3600) / 60), s % 60)
+end
+
+-- Bottom taskbar: [ FCS-10 ][ title.......][ status chip ][ HH:MM:SS ].
+-- opts.footer (still accepted by every call site) is intentionally never
+-- read here - there's no equivalent slot in this layout, so it's just
+-- inert now, same as cycleTheme() becoming a no-op with one theme.
+local function drawTaskbar(opts, theme, w, h)
+    local row = h
+    local badge = " " .. BADGE_TEXT
+    local badgeW = #badge
+
+    term.setBackgroundColor(theme.taskbarBg)
+    term.setTextColor(theme.taskbarText)
+    term.setCursorPos(1, row)
+    term.write(string.rep(" ", w))
+
+    term.setBackgroundColor(theme.startBadgeBg)
+    term.setTextColor(theme.startBadgeText)
+    term.setCursorPos(1, row)
+    term.write(badge)
+
+    local clock = clockText()
+    local chip = (opts.statusRight and #opts.statusRight > 0) and ("[" .. opts.statusRight .. "]") or ""
+    local middleStart, middleEnd = badgeW + 2, w - CLOCK_W - 1
+    local middleW = math.max(0, middleEnd - middleStart + 1)
+    if #chip > middleW then
+        chip = chip:sub(1, middleW)
+    end
+
+    -- Status chip wins the shrink budget over the title - on a reactor
+    -- panel, plant state matters more than the cosmetic node title.
+    local title = opts.title or ""
+    local titleBudget = math.max(0, middleW - #chip - (#chip > 0 and 1 or 0))
+    if #title > titleBudget then
+        title = title:sub(1, titleBudget)
+    end
+
+    term.setBackgroundColor(theme.taskbarBg)
+    term.setTextColor(theme.taskbarText)
+    term.setCursorPos(middleStart, row)
+    term.write(title)
+
+    if #chip > 0 then
+        term.setTextColor(opts.statusColor or theme.taskbarText)
+        term.setCursorPos(middleEnd - #chip + 1, row)
+        term.write(chip)
+    end
+
+    term.setTextColor(theme.clockText)
+    term.setCursorPos(w - CLOCK_W + 1, row)
+    term.write(clock)
 end
 
 -- opts: { title, statusRight, statusColor, icons, footer }. Returns the
 -- laid-out icon list (with hit regions) for the caller to pass into
 -- hitTestIcons. statusColor lets the caller (e.g. a plant-state chip)
--- recolor just the statusRight text against the title bar's own line,
--- without needing a second draw pass at the same position. Draws its own
--- full double-line panel frame (top/bottom border + side verticals) - a
--- node's desktop screen never needs a separate os_shell.drawScreenFrame()
--- call the way Settings/Network screens do (see that function below).
+-- recolor just the status text in the taskbar. Fills the whole screen with
+-- theme.wallpaperBg (edge-to-edge, no bezel) and reserves only the last row
+-- for the taskbar - a node's desktop never needs a separate
+-- os_shell.drawScreenFrame() call the way Settings/Network screens do (see
+-- that function below).
 function os_shell.drawDesktop(opts)
     opts = opts or {}
     local w, h = term.getSize()
     local theme = os_shell.THEME
 
-    term.setBackgroundColor(theme.bg)
-    term.setTextColor(theme.text)
+    term.setBackgroundColor(theme.wallpaperBg)
+    term.setTextColor(theme.iconText)
     term.clear()
 
-    -- Row 1: double-line top border with title/status embedded.
-    term.setTextColor(theme.frame)
-    term.setCursorPos(1, 1)
-    term.write(CH.tl .. string.rep(CH.h, math.max(0, w - 2)) .. CH.tr)
-
-    -- Title/status sit directly on the plain background (this row is
-    -- line-drawn, not a filled bar - see barBg/barText's own comment above),
-    -- so they use theme.text for contrast against theme.bg, not barText
-    -- (which is paired specifically with barBg elsewhere).
-    term.setTextColor(theme.text)
-    term.setCursorPos(3, 1)
-    term.write(" " .. (opts.title or "") .. " ")
-
-    if opts.statusRight then
-        local label = " " .. opts.statusRight .. " "
-        local x = math.max(4 + #(opts.title or ""), w - #label - 1)
-        term.setTextColor(opts.statusColor or theme.text)
-        term.setCursorPos(x, 1)
-        term.write(label)
-    end
-
-    -- Side verticals + bottom border.
-    term.setTextColor(theme.frame)
-    for row = 2, h - 1 do
-        term.setCursorPos(1, row)
-        term.write(CH.v)
-        term.setCursorPos(w, row)
-        term.write(CH.v)
-    end
-    term.setCursorPos(1, h)
-    term.write(CH.bl .. string.rep(CH.h, math.max(0, w - 2)) .. CH.br)
-    if opts.footer then
-        term.setTextColor(theme.dim)
-        term.setCursorPos(3, h)
-        term.write(" " .. opts.footer .. " ")
-    end
-
-    local icons = layoutIcons(opts.icons or {}, w, 3)
+    local icons = layoutIcons(opts.icons or {}, w, 2)
     for _, icon in ipairs(icons) do
-        drawIconButton(icon, theme)
+        drawIconTile(icon, theme)
     end
+
+    drawTaskbar(opts, theme, w, h)
 
     return icons
 end
@@ -407,9 +446,9 @@ function os_shell.drawThemeButton(row)
     local label = (" THEME: %s (click to change) "):format(os_shell.currentThemeName():upper())
     term.setBackgroundColor(theme.accent)
     -- barText, not iconText: iconText is calibrated to contrast against
-    -- theme.bg (drawIconButton's black-ish interior), but this button - like
-    -- nodes/hmi.lua's STARTUP/SCRAM/EXIT buttons - is a filled, saturated
-    -- surface, exactly what barText is paired with.
+    -- theme.wallpaperBg (the desktop's icon captions), but this button -
+    -- like nodes/hmi.lua's STARTUP/SCRAM/EXIT buttons - is a filled,
+    -- saturated surface, exactly what barText is paired with.
     term.setTextColor(theme.barText)
     term.setCursorPos(2, row)
     term.write(label)
