@@ -154,22 +154,27 @@ local homeHitRegion = nil -- HOME button hit-region from the last sub-screen chr
 
 local function drawScadaScreen()
     local w, h = term.getSize()
+    local theme = os_shell.THEME
 
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
     term.clear()
 
     homeHitRegion = os_shell.drawScreenHeader(("SCADA - RTU #%d"):format(os.getComputerID()))
 
+    -- Background/black text on the status bar are semantic (a NORMAL/
+    -- ANOMALY status color), not theme colors - fixed across both palettes.
     term.setCursorPos(1, 2)
     term.setBackgroundColor(STATE_COLOR[rtuState.plantState] or colors.gray)
     term.setTextColor(colors.black)
     local stateLine = (" STATE: %s   (monitor-only, no trip authority) "):format(rtuState.plantState)
     term.write(stateLine .. string.rep(" ", math.max(0, w - #stateLine)))
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
 
-    local dataColor = rtuState.online and colors.white or colors.orange
+    -- dataColor: "fresh" reads as the theme's normal text color, "stale"
+    -- stays semantically orange regardless of theme.
+    local dataColor = rtuState.online and theme.text or colors.orange
     term.setTextColor(dataColor)
 
     term.setCursorPos(1, 4)
@@ -184,12 +189,12 @@ local function drawScadaScreen()
     term.setCursorPos(1, 6)
     term.write(("HW: %-7s        AGE: %s"):format(
         peripheralPresent and "PRESENT" or "ABSENT", ageText))
-    term.setTextColor(colors.white)
+    term.setTextColor(theme.text)
 
     term.setCursorPos(1, 8)
-    term.setTextColor(colors.gray)
+    term.setTextColor(theme.dim)
     term.write("LOG:")
-    term.setTextColor(colors.white)
+    term.setTextColor(theme.text)
     for i, line in ipairs(uiLog) do
         local row = 8 + i
         if row > h then
@@ -218,31 +223,38 @@ local function drawDesktopScreen()
     lastDesktopIcons = os_shell.drawDesktop({
         title       = ("FCS-10 RTU #%d"):format(os.getComputerID()),
         statusRight = ("STATE: %s"):format(rtuState.plantState),
-        statusColor = STATE_COLOR[rtuState.plantState] or colors.white,
+        statusColor = STATE_COLOR[rtuState.plantState] or os_shell.THEME.text,
         icons       = DESKTOP_ICONS,
         footer      = "Click an icon to launch a program.",
     })
 end
 
+local themeButtonRegion = nil -- theme-toggle hit-region from the last drawSettingsScreen()
+
 local function drawSettingsScreen()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
     term.clear()
     homeHitRegion = os_shell.drawScreenHeader("SETTINGS")
-    os_shell.drawKeyValueList({
+    local nextRow = os_shell.drawKeyValueList({
         { label = "Role",        value = "RTU (monitor-only)" },
         { label = "Computer ID", value = os.getComputerID() },
         { label = "Reactor HW",  value = peripheralPresent and "PRESENT" or "ABSENT",
           color = peripheralPresent and colors.green or colors.red },
         { label = "Plant state", value = rtuState.plantState,
-          color = STATE_COLOR[rtuState.plantState] or colors.white },
+          color = STATE_COLOR[rtuState.plantState] or theme.text },
         { label = "Trip authority", value = "NONE - see nodes/plc.lua" },
     }, 3)
+    themeButtonRegion = os_shell.drawThemeButton(nextRow + 1)
+    local _, h = term.getSize()
+    os_shell.drawScreenFrame(1, h)
 end
 
 local function drawNetworkScreen()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
     term.clear()
     homeHitRegion = os_shell.drawScreenHeader("NETWORK")
     local ageText = rtuState.lastUpdate > 0
@@ -255,6 +267,8 @@ local function drawNetworkScreen()
         { label = "Last reading age", value = ageText },
         { label = "Heartbeat every",  value = NET.HEARTBEAT_INTERVAL_S .. "s" },
     }, 3)
+    local _, h = term.getSize()
+    os_shell.drawScreenFrame(1, h)
 end
 
 -- Single dispatch point every draw call site below goes through - which
@@ -532,6 +546,9 @@ local function main()
                         currentScreen = key
                         safeDraw()
                     end
+                elseif currentScreen == "settings" and os_shell.isPointIn(themeButtonRegion, x, y) then
+                    os_shell.cycleTheme()
+                    safeDraw()
                 elseif homeHitRegion and os_shell.isHomeClick(x, y) then
                     currentScreen = "desktop"
                     safeDraw()

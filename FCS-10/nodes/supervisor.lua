@@ -117,22 +117,22 @@ local TREND_EPS = { damagePct = 0.1, coreTempK = 1, coolantPct = 0.5, wastePct =
 -- blocking read() prompt here for more than HEARTBEAT_TIMEOUT_S would cause
 -- every PLC's own watchdog to assume this node is dead and fail-safe SCRAM
 -- the whole fleet.
-local currentTheme = {
-    btnSafe    = colors.green,
-    btnDanger  = colors.red,
-    btnNeutral = colors.lightBlue,
-    text       = colors.white,
-}
-
+--
+-- Colors now come from os_shell.THEME rather than a local table (unlike
+-- the "keep it local" framing above, which is about the drawButton/
+-- hitTestButtons *pattern*, not the palette itself) - so this screen's
+-- buttons stay in sync with whatever theme Settings has switched to,
+-- instead of being stuck on one fixed palette forever.
 local function drawButton(btn, selected)
-    term.setBackgroundColor(selected and colors.white or currentTheme[btn.colorKey])
-    term.setTextColor(selected and colors.black or colors.white)
+    local theme = os_shell.THEME
+    term.setBackgroundColor(selected and colors.white or theme[btn.colorKey])
+    term.setTextColor(selected and colors.black or theme.text)
     term.setCursorPos(btn.x, btn.y)
     term.write(string.rep(" ", btn.width))
     term.setCursorPos(btn.x + math.floor((btn.width - #btn.label) / 2), btn.y)
     term.write(btn.label)
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
 end
 
 local function hitTestButtons(buttons, x, y)
@@ -759,8 +759,8 @@ local function drawTabBar(w)
     if x <= w then
         term.write(string.rep(" ", w - x + 1))
     end
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(os_shell.THEME.bg)
+    term.setTextColor(os_shell.THEME.text)
 end
 
 -- SVR tab: the system-wide summary that used to occupy rows 2-6 of the old
@@ -796,8 +796,8 @@ local function drawSvrTab(w)
     local headerLine = (" SYSTEM: %s  (%d PLC%s, %d offline) "):format(
         status, plcCount, plcCount == 1 and "" or "s", offlineCount)
     term.write(headerLine .. string.rep(" ", math.max(0, w - #headerLine)))
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(os_shell.THEME.bg)
+    term.setTextColor(os_shell.THEME.text)
 
     term.setCursorPos(1, 4)
     term.write(("HB TX: %s ago (%ds cadence)"):format(fmtAge(os.epoch("utc") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S))
@@ -816,7 +816,7 @@ local function drawSvrTab(w)
         term.setTextColor(colors.red)
         term.write("NOT OPEN (retrying)")
     end
-    term.setTextColor(colors.white)
+    term.setTextColor(os_shell.THEME.text)
 
     term.setCursorPos(1, 6)
     term.write("CMD: " .. formatCommandStatus(lastCommandRef))
@@ -838,7 +838,7 @@ local function drawSvrTab(w)
     if lotoCount > 0 then
         term.setTextColor(colors.red)
         term.write(("LOTO: %d reactor%s tagged"):format(lotoCount, lotoCount == 1 and "" or "s"))
-        term.setTextColor(colors.white)
+        term.setTextColor(os_shell.THEME.text)
     else
         term.write("LOTO: none active")
     end
@@ -921,13 +921,13 @@ local function drawRoleTab(h, predicate, showButtons)
             term.setBackgroundColor(colors.white)
             term.setTextColor(colors.black)
         else
-            term.setTextColor(online and colors.white or colors.orange)
+            term.setTextColor(online and os_shell.THEME.text or colors.orange)
         end
         -- "R" prefix instead of "#" for an RTU row - kept even though each
         -- tab is now role-pure, so a row's own identity stays legible if
         -- it's ever screenshotted/logged out of context.
         term.write(string.format("%s%-3d", rec.role == "RTU" and "R" or "#", plcId))
-        term.setBackgroundColor(colors.black)
+        term.setBackgroundColor(os_shell.THEME.bg)
 
         -- LOTO / Testing glyphs: last-known value shown regardless of
         -- `online`, same as every other data column (stale-but-last-known
@@ -942,7 +942,7 @@ local function drawRoleTab(h, predicate, showButtons)
         elseif s.plantState == STATES.ANOMALY then
             term.setTextColor(colors.orange)
         else
-            term.setTextColor(online and colors.white or colors.orange)
+            term.setTextColor(online and os_shell.THEME.text or colors.orange)
         end
         local stateText = s.plantState
         if s.plantState == STATES.NORMAL and rec.operatingMode then
@@ -951,10 +951,10 @@ local function drawRoleTab(h, predicate, showButtons)
         term.write(string.format("%-10s", tostring(stateText or "?")))
 
         local ealColor = rec.activeEAL and TIER_BY_ID[rec.activeEAL] and colors[TIER_BY_ID[rec.activeEAL].color]
-        term.setTextColor(ealColor or (online and colors.white or colors.orange))
+        term.setTextColor(ealColor or (online and os_shell.THEME.text or colors.orange))
         term.write(string.format("%-5s", rec.activeEAL or "--"))
 
-        term.setTextColor(online and colors.white or colors.orange)
+        term.setTextColor(online and os_shell.THEME.text or colors.orange)
         term.write(string.format("%5.1f%s ", s.damagePct or 0, trendGlyph(prev and prev.damagePct, s.damagePct, TREND_EPS.damagePct)))
         term.write(string.format("%5.0f%s ", s.coreTempK or 0, trendGlyph(prev and prev.coreTempK, s.coreTempK, TREND_EPS.coreTempK)))
         term.write(string.format("%4.1f%s ", s.coolantPct or 0, trendGlyph(prev and prev.coolantPct, s.coolantPct, TREND_EPS.coolantPct)))
@@ -968,13 +968,13 @@ local function drawRoleTab(h, predicate, showButtons)
             term.write("OFFLINE")
         end
     end
-    term.setTextColor(colors.white)
+    term.setTextColor(os_shell.THEME.text)
 
     if #rows > shown then
         term.setCursorPos(1, tableTop + shown + 1)
         term.setTextColor(colors.gray)
         term.write(("+%d more (all lower severity)"):format(#rows - shown))
-        term.setTextColor(colors.white)
+        term.setTextColor(os_shell.THEME.text)
     end
 end
 
@@ -1014,11 +1014,13 @@ local function drawDesktopScreen()
     lastDesktopIcons = os_shell.drawDesktop({
         title       = ("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()),
         statusRight = ("SYSTEM: %s"):format(status),
-        statusColor = STATUS_COLOR[status] or colors.white,
+        statusColor = STATUS_COLOR[status] or os_shell.THEME.text,
         icons       = DESKTOP_ICONS,
         footer      = "Click an icon to launch a program.",
     })
 end
+
+local themeButtonRegion = nil -- theme-toggle hit-region from the last drawSettingsScreen()
 
 local function drawSettingsScreen()
     homeHitRegion = os_shell.drawScreenHeader("SETTINGS")
@@ -1033,14 +1035,17 @@ local function drawSettingsScreen()
     end
 
     local status = aggregateStatus()
-    os_shell.drawKeyValueList({
+    local nextRow = os_shell.drawKeyValueList({
         { label = "Role",          value = "SUPERVISOR" },
         { label = "Computer ID",   value = os.getComputerID() },
-        { label = "System status", value = status, color = STATUS_COLOR[status] or colors.white },
+        { label = "System status", value = status, color = STATUS_COLOR[status] or os_shell.THEME.text },
         { label = "Known PLCs",    value = plcCount },
         { label = "Known RTUs",    value = rtuCount },
         { label = "Last command",  value = formatCommandStatus(lastCommandRef) },
     }, 3)
+    themeButtonRegion = os_shell.drawThemeButton(nextRow + 1)
+    local _, h = term.getSize()
+    os_shell.drawScreenFrame(1, h)
 end
 
 local function drawNetworkScreen()
@@ -1056,13 +1061,18 @@ local function drawNetworkScreen()
 
     -- Peer list - unlike plc.lua/rtu.lua's Network screens, this node
     -- actually tracks one (the `plcs` table), so it's worth showing here.
+    -- Bounded to h - 1, not h: row h is reserved for drawScreenFrame()'s
+    -- own closing border below, so a full peer list can never collide with
+    -- it (an entry silently overwritten by the border would be worse than
+    -- just not showing it).
     local _, h = term.getSize()
+    local lastRow = h - 1
     local row = 10
-    if row <= h then
+    if row <= lastRow then
         term.setTextColor(colors.gray)
         term.setCursorPos(2, row)
         term.write("Known peers:")
-        term.setTextColor(colors.white)
+        term.setTextColor(os_shell.THEME.text)
         row = row + 1
     end
 
@@ -1073,18 +1083,19 @@ local function drawNetworkScreen()
     table.sort(ids)
 
     for _, plcId in ipairs(ids) do
-        if row > h then
+        if row > lastRow then
             break
         end
         local rec = plcs[plcId]
         local online = isOnline(rec)
         term.setCursorPos(2, row)
-        term.setTextColor(online and colors.white or colors.orange)
+        term.setTextColor(online and os_shell.THEME.text or colors.orange)
         term.write(("%s#%-3d %-4s %s"):format(
             rec.role == "RTU" and "R" or " ", plcId, rec.role or "?", online and "online" or "offline"))
         row = row + 1
     end
-    term.setTextColor(colors.white)
+    term.setTextColor(os_shell.THEME.text)
+    os_shell.drawScreenFrame(1, h)
 end
 
 -- Full clear + redraw-everything each tick: simplest, most robust choice
@@ -1098,8 +1109,8 @@ end
 local function redraw()
     local w, h = term.getSize()
 
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(os_shell.THEME.bg)
+    term.setTextColor(os_shell.THEME.text)
     term.clear()
 
     if currentScreen == "console" then
@@ -1278,6 +1289,8 @@ local function main()
                                 selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
                             end
                         end
+                    elseif currentScreen == "settings" and os_shell.isPointIn(themeButtonRegion, x, y) then
+                        os_shell.cycleTheme()
                     elseif homeHitRegion and os_shell.isHomeClick(x, y) then
                         -- settings/network screens
                         currentScreen = "desktop"

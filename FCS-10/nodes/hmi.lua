@@ -49,37 +49,16 @@ local MSG = config.NETWORK.MSG_TYPE
 local TITLE = "FCS-10 HMI"
 local STATUS_TOP = 15  -- first row of the reserved status console (bottom of screen)
 
--- ===========================================================================
--- THEMING
--- ===========================================================================
--- Button labels are drawn in headerText, not text: headerText is already
--- the key meant to contrast against a filled/colored surface (same role it
--- plays against headerBg), so it reads correctly on both the saturated
--- "classic" button fills and the grayscale "mono" fills below without
--- needing an 8th theme key just for button label color.
-local themes = {
-    classic = {
-        bg         = colors.lightGray,
-        text       = colors.black,
-        headerBg   = colors.gray,
-        headerText = colors.white,
-        btnDanger  = colors.red,
-        btnSafe    = colors.green,
-        btnNeutral = colors.lightBlue,
-    },
-    mono = {
-        bg         = colors.black,
-        text       = colors.white,
-        headerBg   = colors.white,
-        headerText = colors.black,
-        btnDanger  = colors.white,
-        btnSafe    = colors.lightGray,
-        btnNeutral = colors.gray,
-    },
-}
-
-local currentTheme = themes.classic
-
+-- THEMING: colors come from os_shell.THEME/os_shell.THEMES (see
+-- lib/os_shell.lua), not a local table - this file used to keep its own
+-- separate classic/mono palette here, which meant the console screen's
+-- button colors could never actually be switched (nothing ever reassigned
+-- the old `currentTheme` local) while the newer Desktop/Settings/Network
+-- screens already used the shared, switchable os_shell theme. Reusing
+-- os_shell.THEME for everything fixes that split and makes the THEME
+-- button on the Settings screen (see drawSettingsScreen) actually re-skin
+-- the whole node, console included, not just half of it. headerBg/
+-- headerText map to os_shell.THEME's barBg/barText fields.
 local secnetOpen = false -- true once secnet.open() has ever succeeded (see tryOpenSecnet)
 
 -- currentScreen drives ONLY which top-level screen function runs and where
@@ -94,7 +73,7 @@ local homeHitRegion    = nil       -- HOME button hit-region from the last Setti
 -- BUTTON REGISTRY
 -- ===========================================================================
 -- colorKey is a theme key, not a resolved color, so re-theming (setting
--- currentTheme to a different palette) re-colors every button automatically.
+-- os_shell.THEME to a different palette) re-colors every button automatically.
 local buttons = {
     { id = "startup", label = "STARTUP", x = 3,  y = 5, width = 12, colorKey = "btnSafe"    },
     { id = "scram",   label = "SCRAM",   x = 17, y = 5, width = 12, colorKey = "btnDanger"  },
@@ -105,8 +84,9 @@ local buttons = {
 -- RENDERING
 -- ===========================================================================
 local function drawButton(btn)
-    term.setBackgroundColor(currentTheme[btn.colorKey])
-    term.setTextColor(currentTheme.headerText)
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme[btn.colorKey])
+    term.setTextColor(theme.barText)
     term.setCursorPos(btn.x, btn.y)
     term.write(string.rep(" ", btn.width))
     term.setCursorPos(btn.x + math.floor((btn.width - #btn.label) / 2), btn.y)
@@ -114,8 +94,9 @@ local function drawButton(btn)
 end
 
 local function drawStatusBox(w, h)
-    term.setBackgroundColor(currentTheme.headerBg)
-    term.setTextColor(currentTheme.headerText)
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme.barBg)
+    term.setTextColor(theme.barText)
     for row = STATUS_TOP, h do
         term.setCursorPos(1, row)
         term.write(string.rep(" ", w))
@@ -128,8 +109,8 @@ end
 -- replaced by os_shell.drawScreenHeader, which adds the "<HOME" affordance
 -- back out to the desktop shell.
 local function drawConsoleScreen()
-    term.setBackgroundColor(currentTheme.bg)
-    term.setTextColor(currentTheme.text)
+    term.setBackgroundColor(os_shell.THEME.bg)
+    term.setTextColor(os_shell.THEME.text)
     term.clear()
 
     local w, h = term.getSize()
@@ -168,18 +149,30 @@ local function drawDesktopScreen()
     })
 end
 
+local themeButtonRegion = nil -- theme-toggle hit-region from the last drawSettingsScreen()
+
 local function drawSettingsScreen()
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
+    term.clear()
     homeHitRegion = os_shell.drawScreenHeader("SETTINGS")
-    os_shell.drawKeyValueList({
+    local nextRow = os_shell.drawKeyValueList({
         { label = "Role",        value = "HMI (operator console)" },
         { label = "Computer ID", value = os.getComputerID() },
-        { label = "Theme",       value = currentTheme == themes.mono and "mono" or "classic" },
         { label = "secnet",      value = secnetOpen and "OPEN" or "NOT OPEN",
           color = secnetOpen and colors.green or colors.red },
     }, 3)
+    themeButtonRegion = os_shell.drawThemeButton(nextRow + 1)
+    local _, h = term.getSize()
+    os_shell.drawScreenFrame(1, h)
 end
 
 local function drawNetworkScreen()
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
+    term.clear()
     homeHitRegion = os_shell.drawScreenHeader("NETWORK")
     os_shell.drawKeyValueList({
         { label = "secnet",   value = secnetOpen and "OPEN" or "NOT OPEN",
@@ -190,6 +183,8 @@ local function drawNetworkScreen()
     -- No peer list here, unlike nodes/supervisor.lua's Network screen: this
     -- node subscribes to no TELEMETRY and keeps no PLC/RTU registry (see
     -- file header "Future") - showing an empty/fake list would be dishonest.
+    local _, h = term.getSize()
+    os_shell.drawScreenFrame(1, h)
 end
 
 -- Single dispatch point - which screen function actually runs depends only
@@ -253,8 +248,8 @@ local function logStatus(msg)
     local w, h = term.getSize()
     if h < STATUS_TOP then return end
 
-    term.setBackgroundColor(currentTheme.headerBg)
-    term.setTextColor(currentTheme.headerText)
+    term.setBackgroundColor(os_shell.THEME.barBg)
+    term.setTextColor(os_shell.THEME.barText)
     term.setCursorPos(1, STATUS_TOP)
     term.write(string.rep(" ", w))
     term.setCursorPos(2, STATUS_TOP)
@@ -387,6 +382,9 @@ while true do
                 currentScreen = "desktop"
                 safeDrawUI()
             end
+        elseif currentScreen == "settings" and os_shell.isPointIn(themeButtonRegion, p2, p3) then
+            os_shell.cycleTheme()
+            safeDrawUI()
         elseif homeHitRegion and os_shell.isHomeClick(p2, p3) then
             -- settings/network screens
             currentScreen = "desktop"

@@ -209,9 +209,10 @@ local homeHitRegion = nil -- HOME button hit-region from the last sub-screen chr
 
 local function drawScadaScreen()
     local w, h = term.getSize()
+    local theme = os_shell.THEME
 
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
     term.clear()
 
     homeHitRegion = os_shell.drawScreenHeader(("SCADA - PLC #%d"):format(os.getComputerID()))
@@ -219,17 +220,21 @@ local function drawScadaScreen()
     -- Colored status bar, same convention as supervisor.lua's SYSTEM line -
     -- plantState is the safety/alarm status, operatingMode the lifecycle
     -- phase (see file header "OPERATING MODES") - both matter enough to an
-    -- operator to always be visible, never tabbed away.
+    -- operator to always be visible, never tabbed away. Background/black
+    -- text here are semantic (a NORMAL/ANOMALY/SCRAMMED status color), not
+    -- theme colors, so they stay fixed across both palettes on purpose.
     term.setCursorPos(1, 2)
     term.setBackgroundColor(STATE_COLOR[reactorState.plantState] or colors.gray)
     term.setTextColor(colors.black)
     local stateLine = (" STATE: %s   MODE: %s "):format(
         reactorState.plantState, (operatingMode or "?"):gsub("_", " "))
     term.write(stateLine .. string.rep(" ", math.max(0, w - #stateLine)))
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
 
-    local dataColor = reactorState.online and colors.white or colors.orange
+    -- dataColor: "fresh" reads as the theme's normal text color, "stale"
+    -- stays semantically orange regardless of theme.
+    local dataColor = reactorState.online and theme.text or colors.orange
     term.setTextColor(dataColor)
 
     term.setCursorPos(1, 4)
@@ -241,13 +246,13 @@ local function drawScadaScreen()
     term.setCursorPos(1, 5)
     term.write(("BURN %5.1f mB/t   HW: %-7s  AGE: %s"):format(
         reactorState.burnRateMbT, peripheralPresent and "PRESENT" or "ABSENT", ageText))
-    term.setTextColor(colors.white)
+    term.setTextColor(theme.text)
 
     term.setCursorPos(1, 7)
     if lotoTag then
         term.setTextColor(colors.red)
         term.write(("LOTO: TAGGED - %s"):format(lotoTag.reason))
-        term.setTextColor(colors.white)
+        term.setTextColor(theme.text)
     else
         term.write("LOTO: none")
     end
@@ -260,9 +265,9 @@ local function drawScadaScreen()
             or (lastScramActuationConfirmed and "CONFIRMED" or "UNCONFIRMED")))
 
     term.setCursorPos(1, 10)
-    term.setTextColor(colors.gray)
+    term.setTextColor(theme.dim)
     term.write("LOG:")
-    term.setTextColor(colors.white)
+    term.setTextColor(theme.text)
     for i, line in ipairs(uiLog) do
         local row = 10 + i
         if row > h then
@@ -291,35 +296,42 @@ local function drawDesktopScreen()
     lastDesktopIcons = os_shell.drawDesktop({
         title       = ("FCS-10 PLC #%d"):format(os.getComputerID()),
         statusRight = ("STATE: %s"):format(reactorState.plantState),
-        statusColor = STATE_COLOR[reactorState.plantState] or colors.white,
+        statusColor = STATE_COLOR[reactorState.plantState] or os_shell.THEME.text,
         icons       = DESKTOP_ICONS,
         footer      = "Click an icon to launch a program.",
     })
 end
 
+local themeButtonRegion = nil -- theme-toggle hit-region from the last drawSettingsScreen()
+
 local function drawSettingsScreen()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
     term.clear()
     homeHitRegion = os_shell.drawScreenHeader("SETTINGS")
-    os_shell.drawKeyValueList({
+    local nextRow = os_shell.drawKeyValueList({
         { label = "Role",           value = "PLC" },
         { label = "Computer ID",    value = os.getComputerID() },
         { label = "Reactor HW",     value = peripheralPresent and "PRESENT" or "ABSENT",
           color = peripheralPresent and colors.green or colors.red },
         { label = "Plant state",    value = reactorState.plantState,
-          color = STATE_COLOR[reactorState.plantState] or colors.white },
+          color = STATE_COLOR[reactorState.plantState] or theme.text },
         { label = "Operating mode", value = (operatingMode or "?"):gsub("_", " ") },
         { label = "LOTO",           value = lotoTag and ("TAGGED: " .. lotoTag.reason) or "none",
-          color = lotoTag and colors.red or colors.white },
+          color = lotoTag and colors.red or theme.text },
         { label = "Testing mode",   value = testingMode and "ON" or "off" },
         { label = "EPG",            value = epgActive and "ACTIVE" or "--" },
     }, 3)
+    themeButtonRegion = os_shell.drawThemeButton(nextRow + 1)
+    local _, h = term.getSize()
+    os_shell.drawScreenFrame(1, h)
 end
 
 local function drawNetworkScreen()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
+    local theme = os_shell.THEME
+    term.setBackgroundColor(theme.bg)
+    term.setTextColor(theme.text)
     term.clear()
     homeHitRegion = os_shell.drawScreenHeader("NETWORK")
     local ageText = reactorState.lastUpdate > 0
@@ -333,6 +345,8 @@ local function drawNetworkScreen()
         { label = "Heartbeat every",  value = NET.HEARTBEAT_INTERVAL_S .. "s" },
         { label = "Watchdog timeout", value = NET.HEARTBEAT_TIMEOUT_S .. "s" },
     }, 3)
+    local _, h = term.getSize()
+    os_shell.drawScreenFrame(1, h)
 end
 
 -- Single dispatch point every draw call site below goes through - which
@@ -984,6 +998,9 @@ local function main()
                         currentScreen = key
                         safeDraw()
                     end
+                elseif currentScreen == "settings" and os_shell.isPointIn(themeButtonRegion, x, y) then
+                    os_shell.cycleTheme()
+                    safeDraw()
                 elseif homeHitRegion and os_shell.isHomeClick(x, y) then
                     currentScreen = "desktop"
                     safeDraw()
