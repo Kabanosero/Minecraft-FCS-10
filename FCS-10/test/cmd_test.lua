@@ -93,9 +93,17 @@ local function promptSecret(label)
     return read("*")
 end
 
-local function sendCommand(plcId, payload)
-    print(("[TEST] sending %s (requestId=%d) to #%d..."):format(payload.action, payload.requestId, plcId))
-    local ok, err = secnet.send(plcId, NET.PROTOCOL_PLC, MSG.COMMAND, payload)
+-- `protocol` is the target node's own hosting protocol (PROTOCOL_PLC or
+-- PROTOCOL_RTU) - matches this project's "tag = audience's own protocol"
+-- convention every node's outbound traffic already follows (see e.g.
+-- nodes/rtu.lua's header). Delivery itself is by computer ID regardless of
+-- this tag (rednet protocol strings aren't a delivery filter on this
+-- shared-secret network - see nodes/rtu.lua's rednet_message handling), but
+-- keeping the wire format self-documenting matters more than strict
+-- necessity here.
+local function sendCommand(targetId, protocol, payload)
+    print(("[TEST] sending %s (requestId=%d) to #%d..."):format(payload.action, payload.requestId, targetId))
+    local ok, err = secnet.send(targetId, protocol, MSG.COMMAND, payload)
     if not ok then
         print("[TEST] send failed: " .. tostring(err))
         return
@@ -118,7 +126,7 @@ local function runScram()
         print("[TEST] invalid PLC id")
         return
     end
-    sendCommand(plcId, { action = "SCRAM", requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "SCRAM", requestId = nextRequestId() })
 end
 
 local function runSetBurnRate()
@@ -137,7 +145,7 @@ local function runSetBurnRate()
         print("[TEST] invalid supervisor key")
         return
     end
-    sendCommand(plcId, { action = "SET_BURN_RATE", value = rate, supervisorKey = supervisorKey, requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "SET_BURN_RATE", value = rate, supervisorKey = supervisorKey, requestId = nextRequestId() })
 end
 
 local function runApplyTag()
@@ -156,7 +164,7 @@ local function runApplyTag()
         print("[TEST] invalid supervisor key")
         return
     end
-    sendCommand(plcId, { action = "APPLY_TAG", reason = reason, supervisorKey = supervisorKey, requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "APPLY_TAG", reason = reason, supervisorKey = supervisorKey, requestId = nextRequestId() })
 end
 
 local function runRemoveTag()
@@ -170,7 +178,7 @@ local function runRemoveTag()
         print("[TEST] invalid supervisor key")
         return
     end
-    sendCommand(plcId, { action = "REMOVE_TAG", supervisorKey = supervisorKey, requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "REMOVE_TAG", supervisorKey = supervisorKey, requestId = nextRequestId() })
 end
 
 local function runOpenBypass()
@@ -179,7 +187,7 @@ local function runOpenBypass()
         print("[TEST] invalid PLC id")
         return
     end
-    sendCommand(plcId, { action = "OPEN_STEAM_BYPASS", requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "OPEN_STEAM_BYPASS", requestId = nextRequestId() })
 end
 
 local function runCloseBypass()
@@ -188,7 +196,7 @@ local function runCloseBypass()
         print("[TEST] invalid PLC id")
         return
     end
-    sendCommand(plcId, { action = "CLOSE_STEAM_BYPASS", requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "CLOSE_STEAM_BYPASS", requestId = nextRequestId() })
 end
 
 local function runEnterTesting()
@@ -202,7 +210,7 @@ local function runEnterTesting()
         print("[TEST] invalid supervisor key")
         return
     end
-    sendCommand(plcId, { action = "ENTER_TESTING", supervisorKey = supervisorKey, requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "ENTER_TESTING", supervisorKey = supervisorKey, requestId = nextRequestId() })
 end
 
 local function runExitTesting()
@@ -216,7 +224,36 @@ local function runExitTesting()
         print("[TEST] invalid supervisor key")
         return
     end
-    sendCommand(plcId, { action = "EXIT_TESTING", supervisorKey = supervisorKey, requestId = nextRequestId() })
+    sendCommand(plcId, NET.PROTOCOL_PLC, { action = "EXIT_TESTING", supervisorKey = supervisorKey, requestId = nextRequestId() })
+end
+
+-- The two RTU-targeted actions below (see nodes/rtu.lua's "AUXILIARY
+-- COMMAND HANDLING" section for the full contract) - neither takes a
+-- Shift Supervisor key, matching that file's own reasoning: dumping-mode
+-- cycling and alarm playback are "Operator-tier" (ungated), same bucket as
+-- plc.lua's SCRAM/steam-bypass, not the reactivity-changing bucket
+-- SET_BURN_RATE/tag actions above are gated for.
+local function runCycleTurbineDumping()
+    local rtuId = promptNumber("Target RTU ID: ")
+    if type(rtuId) ~= "number" then
+        print("[TEST] invalid RTU id")
+        return
+    end
+    local target = promptLine("Turbine peripheral name (from RTU's SYSTEMS screen/log): ")
+    if type(target) ~= "string" or target == "" then
+        print("[TEST] invalid turbine peripheral name")
+        return
+    end
+    sendCommand(rtuId, NET.PROTOCOL_RTU, { action = "CYCLE_TURBINE_DUMPING_MODE", target = target, requestId = nextRequestId() })
+end
+
+local function runPlayAlarm()
+    local rtuId = promptNumber("Target RTU ID: ")
+    if type(rtuId) ~= "number" then
+        print("[TEST] invalid RTU id")
+        return
+    end
+    sendCommand(rtuId, NET.PROTOCOL_RTU, { action = "PLAY_ALARM", requestId = nextRequestId() })
 end
 
 print("FCS-10 command test tool.")
@@ -230,6 +267,8 @@ while true do
     print("6) CLOSE STEAM BYPASS")
     print("7) ENTER TESTING MODE")
     print("8) EXIT TESTING MODE")
+    print("9) CYCLE TURBINE DUMPING MODE (RTU)")
+    print("10) PLAY ALARM (RTU)")
     print("q) quit")
     local choice = promptLine("> ")
 
@@ -251,6 +290,10 @@ while true do
         runEnterTesting()
     elseif choice == "8" then
         runExitTesting()
+    elseif choice == "9" then
+        runCycleTurbineDumping()
+    elseif choice == "10" then
+        runPlayAlarm()
     else
         print("[TEST] unrecognized option")
     end
