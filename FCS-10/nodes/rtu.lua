@@ -145,6 +145,7 @@ rtuState.aux = {
     prcs                   = {}, -- [peripheralName] = { ...PRC fields... }
     tanks                  = {}, -- [peripheralName] = { ...DYNAMIC_TANK fields... }
     envDetectors           = {}, -- [peripheralName] = { ...ENV_DETECTOR fields... }
+    speakers               = {}, -- [peripheralName] = true (no readable getters - presence only)
     inductionMatrix        = nil, -- singleton: { ...INDUCTION_MATRIX fields... } | nil
     sps                    = nil, -- singleton: { ...SPS fields... } | nil
 }
@@ -329,6 +330,9 @@ local function drawSystemsScreen()
     end
     for name, t in pairs(aux.envDetectors) do
         addRow("ENV " .. name, ("radiation=%s Sv/h"):format(fmtNum(t.radiationRaw)))
+    end
+    for name in pairs(aux.speakers) do
+        addRow("SPEAKER " .. name, "status=CONNECTED")
     end
     if aux.inductionMatrix then
         local m = aux.inductionMatrix
@@ -817,13 +821,18 @@ end
 -- `stored` is special-cased: Mekanism's getStored() returns a raw
 -- {amount=, ...} chemical/fluid stack table - only .amount is kept, to
 -- keep the broadcast payload small (see plan notes: no raw stack tables).
+-- Second return value `any` is true iff at least one getter succeeded -
+-- see pollAuxUnits below for why that matters (multiblock removal
+-- detection), not just cosmetic.
 local function pollUnitFields(handle, fieldMap)
     local out = {}
+    local any = false
     for stateField, getterName in pairs(fieldMap) do
         local getter = handle[getterName]
         if type(getter) == "function" then
             local ok, val = pcall(getter)
             if ok then
+                any = true
                 if stateField == "stored" and type(val) == "table" then
                     out.stored = val.amount
                 else
@@ -832,46 +841,104 @@ local function pollUnitFields(handle, fieldMap)
             end
         end
     end
-    return out
+    return out, any
 end
 
 -- Refreshes rtuState.aux from every currently-detected unit. Called from
 -- pollAndPublish() each tick, right after scanPeripherals() - rides inside
 -- the existing `state = rtuState` TELEMETRY broadcast, no separate payload
 -- field needed (see rtuState.aux's own declaration comment above).
+--
+-- GHOST-MACHINE FIX: most of these Mekanism machines are multiblock
+-- structures - the wrapped peripheral lives on one "port" block, and
+-- removing some OTHER block of the structure (or the whole machine minus
+-- that port) unforms the multiblock without ever detaching the port block
+-- itself. No "peripheral_detach" event fires for that, so
+-- unregisterUnit() (only called from that event, see main()) never runs,
+-- and the unit would otherwise sit in detectedUnits/aux forever showing
+-- blank/stale fields - exactly the "still displaying after removal"
+-- symptom this was fixed for. Mekanism's own getters throw once a
+-- multiblock is unformed, so a poll where EVERY getter fails (pollUnitFields
+-- returns any=false) is treated as equivalent to a detach and unregistered
+-- here, same as tryBindReactor/unbindReactor already does for the reactor
+-- itself. Collected into `dead` and unregistered after the loops below
+-- (rather than inline) so this stays simple to read even though Lua does
+-- in fact permit nil-ing the current key mid-pairs() traversal.
 local function pollAuxUnits()
     local aux = rtuState.aux
+    local dead = {}
 
     aux.turbines, aux.snas, aux.centrifuges = {}, {}, {}
     aux.chemDissolutionChambers, aux.prcs   = {}, {}
     aux.tanks, aux.envDetectors             = {}, {}
 
-    for name, handle in pairs(detectedUnits.TURBINE) do
-        aux.turbines[name] = pollUnitFields(handle, FIELD_MAP.TURBINE)
-    end
-    for name, handle in pairs(detectedUnits.SNA) do
-        aux.snas[name] = pollUnitFields(handle, FIELD_MAP.SNA)
-    end
-    for name, handle in pairs(detectedUnits.CENTRIFUGE) do
-        aux.centrifuges[name] = pollUnitFields(handle, FIELD_MAP.CENTRIFUGE)
-    end
-    for name, handle in pairs(detectedUnits.CHEM_DISSOLUTION) do
-        aux.chemDissolutionChambers[name] = pollUnitFields(handle, FIELD_MAP.CHEM_DISSOLUTION)
-    end
-    for name, handle in pairs(detectedUnits.PRC) do
-        aux.prcs[name] = pollUnitFields(handle, FIELD_MAP.PRC)
-    end
-    for name, handle in pairs(detectedUnits.DYNAMIC_TANK) do
-        aux.tanks[name] = pollUnitFields(handle, FIELD_MAP.DYNAMIC_TANK)
-    end
-    for name, handle in pairs(detectedUnits.ENV_DETECTOR) do
-        aux.envDetectors[name] = pollUnitFields(handle, FIELD_MAP.ENV_DETECTOR)
+    -- Speakers have no readable getters (see FIELD_MAP - there's no
+    -- SPEAKER entry, only the PLAY_ALARM actuator in handleCommand), so
+    -- there's nothing to pollUnitFields here or feed into the `dead`
+    -- ghost-machine check above - presence is exactly what
+    -- detectedUnits.SPEAKER already tracks (kept in sync by
+    -- scanPeripherals/registerUnit/unregisterUnit's own peripheral_detach
+    -- handling), just mirrored into aux so it's visible on the wire and in
+    -- drawSystemsScreen the same way every other aux class already is.
+    aux.speakers = {}
+    for name in pairs(detectedUnits.SPEAKER) do
+        aux.speakers[name] = true
     end
 
-    aux.inductionMatrix = detectedUnits.INDUCTION_MATRIX
-        and pollUnitFields(detectedUnits.INDUCTION_MATRIX.handle, FIELD_MAP.INDUCTION_MATRIX) or nil
-    aux.sps = detectedUnits.SPS
-        and pollUnitFields(detectedUnits.SPS.handle, FIELD_MAP.SPS) or nil
+    local function poll(name, handle, fieldMap, out)
+        local fields, any = pollUnitFields(handle, fieldMap)
+        if any then
+            out[name] = fields
+        else
+            dead[#dead + 1] = name
+        end
+    end
+
+    for name, handle in pairs(detectedUnits.TURBINE) do
+        poll(name, handle, FIELD_MAP.TURBINE, aux.turbines)
+    end
+    for name, handle in pairs(detectedUnits.SNA) do
+        poll(name, handle, FIELD_MAP.SNA, aux.snas)
+    end
+    for name, handle in pairs(detectedUnits.CENTRIFUGE) do
+        poll(name, handle, FIELD_MAP.CENTRIFUGE, aux.centrifuges)
+    end
+    for name, handle in pairs(detectedUnits.CHEM_DISSOLUTION) do
+        poll(name, handle, FIELD_MAP.CHEM_DISSOLUTION, aux.chemDissolutionChambers)
+    end
+    for name, handle in pairs(detectedUnits.PRC) do
+        poll(name, handle, FIELD_MAP.PRC, aux.prcs)
+    end
+    for name, handle in pairs(detectedUnits.DYNAMIC_TANK) do
+        poll(name, handle, FIELD_MAP.DYNAMIC_TANK, aux.tanks)
+    end
+    for name, handle in pairs(detectedUnits.ENV_DETECTOR) do
+        poll(name, handle, FIELD_MAP.ENV_DETECTOR, aux.envDetectors)
+    end
+
+    aux.inductionMatrix = nil
+    if detectedUnits.INDUCTION_MATRIX then
+        local fields, any = pollUnitFields(detectedUnits.INDUCTION_MATRIX.handle, FIELD_MAP.INDUCTION_MATRIX)
+        if any then
+            aux.inductionMatrix = fields
+        else
+            dead[#dead + 1] = detectedUnits.INDUCTION_MATRIX.name
+        end
+    end
+
+    aux.sps = nil
+    if detectedUnits.SPS then
+        local fields, any = pollUnitFields(detectedUnits.SPS.handle, FIELD_MAP.SPS)
+        if any then
+            aux.sps = fields
+        else
+            dead[#dead + 1] = detectedUnits.SPS.name
+        end
+    end
+
+    for _, name in ipairs(dead) do
+        unregisterUnit(name)
+    end
 end
 
 -- ===========================================================================
