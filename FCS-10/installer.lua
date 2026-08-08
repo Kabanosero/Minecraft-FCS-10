@@ -23,11 +23,16 @@ local COMMON_FILES = {
     "lib/os_shell.lua",
 }
 
+-- lib/gfx.lua (CC:Graphics bar-meter gauges) is listed per-role rather than
+-- in COMMON_FILES above, same precedent as lib/rbac.lua below: only the
+-- roles that actually dofile() it (supervisor/plc/rtu - see each node's own
+-- SCADA/table screens) need it fetched. hmi.lua doesn't reference it at
+-- all, matching hmi's own "no live telemetry shown yet" scope.
 local ROLE_FILES = {
-    supervisor = { "nodes/supervisor.lua" },
-    plc        = { "nodes/plc.lua", "lib/rbac.lua" },
+    supervisor = { "nodes/supervisor.lua", "lib/gfx.lua" },
+    plc        = { "nodes/plc.lua", "lib/rbac.lua", "lib/gfx.lua" },
     hmi        = { "nodes/hmi.lua" },
-    rtu        = { "nodes/rtu.lua" },
+    rtu        = { "nodes/rtu.lua", "lib/gfx.lua" },
     test       = { "test/cmd_test.lua" },
 }
 
