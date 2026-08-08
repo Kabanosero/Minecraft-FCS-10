@@ -1103,19 +1103,38 @@ elseif action == "start" then
 elseif action == "update" then
     local targetRole = resolveCliRole(role, "update")
     if targetRole then
-        print("[INSTALLER] Checking " .. targetRole .. " against the repo...")
-        local counts = updateRole(targetRole)
-        writeRoleManifest(targetRole)
-        print(("[INSTALLER] %d current, %d updated, %d failed"):format(
-            counts.current, counts.updated, counts.failed))
-        if counts.updated > 0 then
-            if AUTOBOOT_ROLES[targetRole] then
-                print("[INSTALLER] Updated - reboot this computer to run the new version.")
-            else
-                print("[INSTALLER] Updated - changes take effect next time this script is run.")
+        -- Self-update FIRST, before touching COMMON_FILES/ROLE_FILES below.
+        -- installer.lua is deliberately not one of its own listed files,
+        -- but that means a stale local copy has no way to ever learn a new
+        -- entry was added to those tables - exactly what happened when
+        -- lib/gfx.lua was added: every already-deployed node's local
+        -- installer.lua kept checking only the file list it was fetched
+        -- with, forever, no matter how many times `update` ran, because it
+        -- had no way of knowing its own file list was outdated. If the
+        -- file on disk actually changes here, stop rather than continuing
+        -- with THIS run's already-loaded (now-stale) tables - a running Lua
+        -- script can't hot-reload its own source mid-execution, so only a
+        -- fresh invocation of the newly-fetched installer.lua actually
+        -- picks up whatever changed.
+        local selfStatus = checkAndUpdateFile("installer.lua")
+        if selfStatus == "updated" then
+            print("[INSTALLER] installer.lua itself was updated - run 'installer update " ..
+                  targetRole .. "' again to pick up any newly-added files.")
+        else
+            print("[INSTALLER] Checking " .. targetRole .. " against the repo...")
+            local counts = updateRole(targetRole)
+            writeRoleManifest(targetRole)
+            print(("[INSTALLER] %d current, %d updated, %d failed"):format(
+                counts.current, counts.updated, counts.failed))
+            if counts.updated > 0 then
+                if AUTOBOOT_ROLES[targetRole] then
+                    print("[INSTALLER] Updated - reboot this computer to run the new version.")
+                else
+                    print("[INSTALLER] Updated - changes take effect next time this script is run.")
+                end
+            elseif counts.failed == 0 then
+                print("[INSTALLER] Already up to date.")
             end
-        elseif counts.failed == 0 then
-            print("[INSTALLER] Already up to date.")
         end
     end
 elseif action == "status" then
