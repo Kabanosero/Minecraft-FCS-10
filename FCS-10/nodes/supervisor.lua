@@ -243,6 +243,16 @@ local lastRenderedTableTop  = nil
 local lastRenderedButtons   = {}
 local lastRenderedToolbar   = {} -- BACK/FORWARD/HOME/RELOAD/etc. hit regions, same capture pattern
 local lastRenderedCloseBox  = nil -- title bar's "X" -> desktop, same capture pattern
+local lastRenderedBookmarksButton = nil -- the one real word in the menu bar - see drawMenuBar/drawBookmarksMenu
+local lastRenderedBookmarks = {} -- open dropdown's page-list hit regions, valid only while bookmarksOpen
+
+-- True while the Bookmarks dropdown (see drawBookmarksMenu below) is open.
+-- Persists across redraws (a 1Hz/click-driven full-screen redraw would
+-- otherwise close it every tick) until the operator clicks anything at all -
+-- see main()'s click handler, which checks this FIRST, before every other
+-- console hit-test, so a click while the menu is open can never also land
+-- on whatever's underneath it.
+local bookmarksOpen = false
 
 -- Which of the 3 pages (see TABS/cycleTab below) is currently showing.
 -- "SVR" is the landing tab: an operator's first question on opening this
@@ -798,6 +808,46 @@ local function formatCommandStatus(pend)
 end
 
 -- ---------------------------------------------------------------------------
+-- Non-critical maintenance items - conditions worth an operator's attention
+-- that DON'T already get prominent treatment elsewhere (SCRAM/high-EAL-tier
+-- units already stand out via the PLC/RTU tables' own colored STATE/EAL
+-- columns and the SYSTEM status band - repeating those here would just be
+-- noise). Feeds both the MAINTENANCE page (drawMaintenanceTab) and the SVR
+-- page's own summary count (drawSvrTab). OFFLINE is checked first and
+-- returns immediately - once comms are gone, nothing else about a unit is
+-- trustworthy enough to report as a specific condition.
+-- ---------------------------------------------------------------------------
+local function maintenanceItemsFor(plcId, rec)
+    local items = {}
+    local label = (rec.role == "RTU" and "RTU #" or "PLC #") .. plcId
+
+    if not isOnline(rec) then
+        items[#items + 1] = { text = ("%s OFFLINE (last seen %s ago)"):format(label, fmtAge(os.epoch("utc") - rec.lastSeenTs)),
+            color = colors.orange }
+        return items
+    end
+
+    if rec.state.plantState == STATES.ANOMALY then
+        items[#items + 1] = { text = ("%s hardware anomaly (peripheral not present)"):format(label), color = colors.orange }
+    end
+
+    if rec.activeEAL == "NOUE" then
+        items[#items + 1] = { text = ("%s NOUE - a metric is in its WARNING band"):format(label), color = colors.yellow }
+    end
+
+    if rec.testingMode then
+        items[#items + 1] = { text = ("%s TESTING MODE active"):format(label), color = colors.yellow }
+    end
+
+    if rec.loto then
+        local reason = (type(rec.loto) == "table" and rec.loto.reason) and tostring(rec.loto.reason) or "tagged"
+        items[#items + 1] = { text = ("%s LOTO applied (%s)"):format(label, reason), color = colors.yellow }
+    end
+
+    return items
+end
+
+-- ---------------------------------------------------------------------------
 -- Retro browser chrome (Netscape 4-style) - title bar / menu bar / toolbar /
 -- location bar, rows 1-4, replacing the old flat SVR/PLC/RTU tab strip.
 -- SVR/PLC/RTU are still the exact same 3 pages (see TABS) - what changed is
@@ -815,7 +865,7 @@ end
 -- back to the desktop shell (closing the "browser" returns you to the
 -- "OS") - same role the old tab strip's "<HOME " entry played.
 -- ---------------------------------------------------------------------------
-local TABS = { "SVR", "PLC", "RTU" }
+local TABS = { "SVR", "PLC", "RTU", "MAINTENANCE" }
 
 local function cycleTab(delta)
     local idx = 1
@@ -855,12 +905,43 @@ end
 -- the ones that visibly needed it before.
 local MENU_BAR_TEXT = " File  Edit  View  Go  Bookmarks  Options  Directory  Window  Help"
 
+-- "Bookmarks" is the one word in this bar that's REAL (see
+-- drawBookmarksMenu below) - everything else here stays honest-decorative
+-- (this section's own header comment explains why a fake-clickable dead
+-- menu is worse than an openly inert one). Computed via string.find rather
+-- than a hardcoded column so it can never drift out of sync with
+-- MENU_BAR_TEXT's own literal spacing if that string is ever edited.
+local BOOKMARKS_COL = select(1, MENU_BAR_TEXT:find("Bookmarks"))
+local BOOKMARKS_W   = select(2, MENU_BAR_TEXT:find("Bookmarks")) - BOOKMARKS_COL + 1
+
 local function drawMenuBar(w)
     local text = MENU_BAR_TEXT
     if #text > w then
         text = text:sub(1, w)
     end
     gfx.drawText(1, 2, text .. string.rep(" ", math.max(0, w - #text)), CHROME.barText, CHROME.barBg)
+    lastRenderedBookmarksButton = { x = BOOKMARKS_COL, y = 2, w = BOOKMARKS_W, h = 1 }
+end
+
+-- Real dropdown - the working half of the "Bookmarks" menu item above.
+-- Lists every page (TABS) as a clickable row in a small raised panel
+-- directly under the word "Bookmarks", opened by clicking it (see
+-- lastRenderedBookmarksButton above) and closed by clicking ANYTHING
+-- afterward, item or not (see main()'s click handler) - matches how a real
+-- dropdown menu dismisses on an outside click. Deliberately overlays
+-- whatever's normally drawn at rows 3-6 (part of the toolbar/location bar/
+-- content) while open - authentic dropdown behavior, not a layout bug.
+local BOOKMARK_MENU_W = 14
+
+local function drawBookmarksMenu()
+    local x, y = BOOKMARKS_COL, 3
+    gfx.drawBevel(x, y, BOOKMARK_MENU_W, #TABS, colors.white, colors.white, colors.gray)
+    lastRenderedBookmarks = {}
+    for i, tab in ipairs(TABS) do
+        local marker = (tab == currentTab) and "> " or "  "
+        gfx.drawText(x, y + i - 1, marker .. tab, colors.black, nil)
+        lastRenderedBookmarks[#lastRenderedBookmarks + 1] = { id = tab, x = x, y = y + i - 1, width = BOOKMARK_MENU_W }
+    end
 end
 
 -- id="back"/"forward" cycle TABS; id="home" jumps to SVR; id="reload" forces
@@ -996,6 +1077,18 @@ local function drawSvrTab(w)
     else
         gfx.drawText(1, 10, "LOTO: none active", CHROME.contentText, CHROME.contentBg)
     end
+
+    -- Points at the MAINTENANCE page (Bookmarks -> MAINTENANCE) rather than
+    -- listing items inline here - see maintenanceItemsFor's own header
+    -- comment for why this count deliberately excludes anything that
+    -- already gets its own prominent treatment (SCRAM/high-EAL/DISCONNECTED
+    -- already drive the SYSTEM band above).
+    local maintCount = 0
+    for plcId, rec in pairs(plcs) do
+        maintCount = maintCount + #maintenanceItemsFor(plcId, rec)
+    end
+    gfx.drawText(1, 11, ("MAINTENANCE: %d non-critical item%s"):format(maintCount, maintCount == 1 and "" or "s"),
+        maintCount > 0 and colors.yellow or colors.green, CHROME.contentBg)
 end
 
 -- PLC/RTU tabs: a dedicated table filtered by `predicate(rec)`, worst-first
@@ -1194,6 +1287,55 @@ local function drawRoleTab(h, predicate, showButtons)
     end
 end
 
+-- MAINTENANCE page: every currently-known PLC/RTU's non-critical items in
+-- one place (see maintenanceItemsFor above). Rows are clickable the same
+-- way the PLC/RTU tables' rows are - reuses lastRenderedRows/
+-- lastRenderedTableTop rather than a separate mechanism (see main()'s click
+-- handler, which branches on currentTab to tell the two shapes apart:
+-- a plain plcId on the PLC/RTU pages, a {plcId, role} table here, since a
+-- click here needs to know which page to jump to as well as which row).
+-- Clicking a row jumps straight to that unit's own PLC/RTU page with it
+-- selected, ready for SCRAM/bypass if it's a PLC.
+local function drawMaintenanceTab(w, h)
+    lastRenderedButtons = {}
+
+    local tableTop = 5
+    gfx.drawText(1, tableTop, "NON-CRITICAL FACILITY ITEMS", CHROME.contentText, CHROME.contentBg)
+
+    local items = {}
+    for plcId, rec in pairs(plcs) do
+        for _, item in ipairs(maintenanceItemsFor(plcId, rec)) do
+            items[#items + 1] = { plcId = plcId, role = rec.role, text = item.text, color = item.color }
+        end
+    end
+    table.sort(items, function(a, b) return a.plcId < b.plcId end)
+
+    lastRenderedRows = {}
+    lastRenderedTableTop = tableTop
+
+    if #items == 0 then
+        gfx.drawText(1, tableTop + 2, "No non-critical items - facility nominal.", colors.green, CHROME.contentBg)
+        return
+    end
+
+    local maxRows = math.max(0, h - tableTop - 1)
+    local shown = math.min(#items, maxRows)
+    for i = 1, shown do
+        local it = items[i]
+        local row = tableTop + i
+        lastRenderedRows[i] = { plcId = it.plcId, role = it.role }
+        local text = it.text
+        if #text > w then
+            text = text:sub(1, w)
+        end
+        gfx.drawText(1, row, text, it.color, CHROME.contentBg)
+    end
+
+    if #items > shown then
+        gfx.drawText(1, tableTop + shown + 1, ("+%d more"):format(#items - shown), colors.gray, CHROME.contentBg)
+    end
+end
+
 -- The pre-existing SVR/PLC/RTU tabbed view, now one of four top-level
 -- screens (see "DESKTOP SHELL" below) rather than the only thing this file
 -- ever draws - reskinned as a retro browser window (see the CHROME palette
@@ -1227,11 +1369,19 @@ local function drawConsoleScreen(w, h)
         drawRoleTab(h - 1, function(rec) return rec.role ~= "RTU" end, true)
     elseif currentTab == "RTU" then
         drawRoleTab(h - 1, function(rec) return rec.role == "RTU" end, false)
+    elseif currentTab == "MAINTENANCE" then
+        drawMaintenanceTab(w, h - 1)
     else
         drawSvrTab(w)
     end
 
     drawStatusBar(w, h)
+
+    -- Drawn LAST, on top of everything above, and only while open - see
+    -- lastRenderedBookmarksButton's own doc comment.
+    if bookmarksOpen then
+        drawBookmarksMenu()
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1528,9 +1678,25 @@ local function main()
                             currentScreen = key
                         end
                     elseif currentScreen == "console" then
-                        if lastRenderedCloseBox and os_shell.isPointIn(
+                        if bookmarksOpen then
+                            -- Any click closes the dropdown, whether or not
+                            -- it landed on an item - matches how a real
+                            -- menu dismisses on an outside click. This
+                            -- branch is checked FIRST, before every other
+                            -- console hit-test, so a click while the menu
+                            -- is open can never also land on whatever's
+                            -- underneath it.
+                            local item = hitTestButtons(lastRenderedBookmarks, x, y)
+                            if item then
+                                currentTab = item.id
+                                selectedPlcId = nil
+                            end
+                            bookmarksOpen = false
+                        elseif lastRenderedCloseBox and os_shell.isPointIn(
                             { x = lastRenderedCloseBox.x, y = lastRenderedCloseBox.y, w = lastRenderedCloseBox.width, h = 1 }, x, y) then
                             currentScreen = "desktop"
+                        elseif lastRenderedBookmarksButton and os_shell.isPointIn(lastRenderedBookmarksButton, x, y) then
+                            bookmarksOpen = true
                         else
                             local toolBtn = hitTestButtons(lastRenderedToolbar, x, y)
                             if toolBtn and toolBtn.enabled then
@@ -1560,7 +1726,16 @@ local function main()
                                         end
                                     end
                                 elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
-                                    selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
+                                    local rowSel = lastRenderedRows[y - lastRenderedTableTop]
+                                    if currentTab == "MAINTENANCE" then
+                                        -- rowSel is {plcId, role} here, not
+                                        -- a plain plcId - see
+                                        -- drawMaintenanceTab's own comment.
+                                        currentTab = rowSel.role == "RTU" and "RTU" or "PLC"
+                                        selectedPlcId = rowSel.plcId
+                                    else
+                                        selectedPlcId = rowSel
+                                    end
                                 end
                             end
                         end
