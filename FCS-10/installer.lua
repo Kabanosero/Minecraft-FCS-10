@@ -16,6 +16,19 @@
 
 local BASE_URL = "https://raw.githubusercontent.com/Kabanosero/Minecraft-FCS-10/main/FCS-10/"
 
+-- raw.githubusercontent.com sits behind a CDN (Fastly) that caches responses
+-- for a few minutes after a push - a computer running `installer update`
+-- shortly after a push can genuinely be served yesterday's file even though
+-- the repo itself is current. A unique query-string nonce per request is the
+-- standard fix: the CDN's cache key includes the full URL (query string
+-- included), so a value that's different every call guarantees a cache miss
+-- and a fresh fetch straight from GitHub. Every http.get call site in this
+-- file goes through this, so every download/update/status check is always
+-- looking at the actual current file, not a stale cached one.
+local function bustCache(url)
+    return url .. "?_=" .. tostring(os.epoch("utc"))
+end
+
 local COMMON_FILES = {
     "lib/config.lua",
     "lib/md5.lua",
@@ -63,7 +76,7 @@ local function downloadFile(path, onStatus)
         onStatus(path, "active")
     end
 
-    local url = BASE_URL .. path
+    local url = bustCache(BASE_URL .. path)
 
     local response, err = http.get(url)
     if not response then
@@ -239,7 +252,7 @@ local function checkAndUpdateFile(path, onStatus)
         onStatus(path, "active")
     end
 
-    local url = BASE_URL .. path
+    local url = bustCache(BASE_URL .. path)
     local response, err = http.get(url)
     if not response then
         if onStatus then
@@ -328,7 +341,7 @@ local function checkFileStatus(path, onStatus)
         onStatus(path, "active")
     end
 
-    local url = BASE_URL .. path
+    local url = bustCache(BASE_URL .. path)
     local response, err = http.get(url)
     if not response then
         if onStatus then
