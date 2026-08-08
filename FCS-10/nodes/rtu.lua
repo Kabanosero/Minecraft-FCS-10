@@ -117,6 +117,17 @@ if not okShell then
     return
 end
 
+-- gfx (CC:Graphics bar-meter gauges) load is NON-FATAL, same reasoning as
+-- every other lib load in this file's siblings: a missing/broken optional
+-- visual mod must never take down a monitoring node. If it fails to load,
+-- `gfx` stays nil and drawScadaScreen's gauge rows fall back to plain text.
+local okGfx, gfxModule = pcall(dofile, "/lib/gfx.lua")
+local gfx = okGfx and gfxModule or nil
+if not okGfx then
+    print("[RTU] WARNING: failed to load /lib/gfx.lua: " .. tostring(gfxModule) ..
+          " - SCADA gauges will render as plain text")
+end
+
 local NET    = config.NETWORK
 local MSG    = config.NETWORK.MSG_TYPE
 local STATES = config.STATES
@@ -230,9 +241,60 @@ local STATE_COLOR = {
 
 local homeHitRegion = nil -- HOME button hit-region from the last sub-screen chrome draw
 
+-- ---------------------------------------------------------------------------
+-- SCADA gauge rows - DMG/T-K/CLT/WST/FUEL as bar-meter gauges (lib/gfx.lua,
+-- real pixels via CC:Graphics if available, a plain "####----" ASCII bar
+-- otherwise) instead of the flat text lines this screen used to show.
+--
+-- COLOR CHOICE DELIBERATELY DIFFERS FROM plc.lua's GAUGES: plc.lua bands
+-- each metric's own SP.* setpoint thresholds (green/yellow/red per-metric
+-- severity) because it owns trip authority and already imports SP for its
+-- real trip logic. This file's header is explicit that this node "never
+-- evaluates a setpoint" and deliberately never imports config.SETPOINTS at
+-- all - importing it here just to color a gauge would be a purely cosmetic
+-- reason to cross a line this file draws on principle. So every gauge here
+-- is instead colored by rtuState.plantState (already this file's own
+-- presence/comms-health signal, same one STATE_COLOR already renders on the
+-- status bar) - green while NORMAL, orange while ANOMALY. That's strictly
+-- less informative than plc.lua's per-metric bands, and that's the point:
+-- this node makes no judgment about any individual reading, only about
+-- whether its own telemetry is currently trustworthy.
+-- ---------------------------------------------------------------------------
+local GAUGE_LABEL_W, GAUGE_VALUE_W = 5, 7
+
+local function drawMetricGauge(w, dataColor, row, label, pct, valueText, fillColor)
+    term.setTextColor(dataColor)
+    term.setCursorPos(1, row)
+    term.write(("%-" .. GAUGE_LABEL_W .. "s"):format(label))
+
+    local gaugeX = GAUGE_LABEL_W + 1
+    local gaugeW = math.max(1, w - gaugeX - GAUGE_VALUE_W - 1)
+    local clamped = math.max(0, math.min(100, pct or 0))
+    local filled = math.floor(gaugeW * clamped / 100 + 0.5)
+    local asciiBar = string.rep("#", filled) .. string.rep("-", gaugeW - filled)
+
+    if gfx then
+        gfx.drawBarMeter(gaugeX, row, gaugeW, 1, clamped, fillColor, colors.gray, asciiBar)
+    else
+        term.setCursorPos(gaugeX, row)
+        term.setTextColor(fillColor)
+        term.write(asciiBar)
+    end
+
+    term.setTextColor(dataColor)
+    term.setCursorPos(w - GAUGE_VALUE_W + 1, row)
+    term.write(("%" .. GAUGE_VALUE_W .. "s"):format(valueText))
+end
+
 local function drawScadaScreen()
     local w, h = term.getSize()
     local theme = os_shell.THEME
+
+    -- Leaving graphics mode is handled unconditionally at the top of draw()
+    -- (see below) - this is what turns it back ON for this screen's gauges.
+    if gfx then
+        gfx.beginFrame()
+    end
 
     term.setBackgroundColor(theme.bg)
     term.setTextColor(theme.text)
@@ -253,28 +315,37 @@ local function drawScadaScreen()
     -- dataColor: "fresh" reads as the theme's normal text color, "stale"
     -- stays semantically orange regardless of theme.
     local dataColor = rtuState.online and theme.text or colors.orange
+    local gaugeColor = STATE_COLOR[rtuState.plantState] or colors.gray
+
+    -- Rows 4-8: DMG/T-K/CLT/WST/FUEL gauges (was two flat text lines on
+    -- rows 4-5 - the extra rows this now takes push everything below down;
+    -- there were already enough spare blank rows at the bottom of a 19-row
+    -- terminal for this to still fit with room left over).
+    drawMetricGauge(w, dataColor, 4, "DMG", rtuState.damagePct,
+        ("%.1f%%"):format(rtuState.damagePct), gaugeColor)
+    drawMetricGauge(w, dataColor, 5, "T-K", rtuState.coreTempK / 1200 * 100,
+        ("%.0fK"):format(rtuState.coreTempK), gaugeColor)
+    drawMetricGauge(w, dataColor, 6, "CLT", rtuState.coolantPct,
+        ("%.1f%%"):format(rtuState.coolantPct), gaugeColor)
+    drawMetricGauge(w, dataColor, 7, "WST", rtuState.wastePct,
+        ("%.1f%%"):format(rtuState.wastePct), gaugeColor)
+    drawMetricGauge(w, dataColor, 8, "FUEL", rtuState.fuelPct,
+        ("%.1f%%"):format(rtuState.fuelPct), gaugeColor)
     term.setTextColor(dataColor)
-
-    term.setCursorPos(1, 4)
-    term.write(("DMG  %5.1f%%   T-K  %5.0f   CLT %5.1f%%  WST %5.1f%%"):format(
-        rtuState.damagePct, rtuState.coreTempK, rtuState.coolantPct, rtuState.wastePct))
-
-    term.setCursorPos(1, 5)
-    term.write(("BURN %5.1f mB/t   FUEL %5.1f%%"):format(rtuState.burnRateMbT, rtuState.fuelPct))
 
     local ageText = rtuState.lastUpdate > 0
         and fmtAge(os.epoch("utc") - rtuState.lastUpdate) or "--"
-    term.setCursorPos(1, 6)
-    term.write(("HW: %-7s        AGE: %s"):format(
-        peripheralPresent and "PRESENT" or "ABSENT", ageText))
+    term.setCursorPos(1, 9)
+    term.write(("BURN %5.1f mB/t   HW: %-7s  AGE: %s"):format(
+        rtuState.burnRateMbT, peripheralPresent and "PRESENT" or "ABSENT", ageText))
     term.setTextColor(theme.text)
 
-    term.setCursorPos(1, 8)
+    term.setCursorPos(1, 11)
     term.setTextColor(theme.dim)
     term.write("LOG:")
     term.setTextColor(theme.text)
     for i, line in ipairs(uiLog) do
-        local row = 8 + i
+        local row = 11 + i
         if row > h then
             break
         end
@@ -438,6 +509,14 @@ end
 -- screen function actually runs depends only on currentScreen, a purely
 -- local display choice with no effect on the poll/broadcast logic above.
 local function draw()
+    -- Unconditional, every tick, BEFORE branching: guarantees the terminal
+    -- starts this draw from a known text-mode state no matter which screen
+    -- ran last tick (see lib/gfx.lua's own doc comment on this pattern).
+    -- drawScadaScreen() is the only screen that turns graphics mode back on.
+    if gfx then
+        gfx.endFrame()
+    end
+
     if currentScreen == "scada" then
         drawScadaScreen()
     elseif currentScreen == "systems" then

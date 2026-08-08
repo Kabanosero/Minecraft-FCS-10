@@ -68,6 +68,17 @@ if not okShell then
     return
 end
 
+-- gfx (CC:Graphics trend arrows) load is NON-FATAL, same reasoning as every
+-- other optional lib in this project: a missing/broken visual mod must
+-- never take down the Supervisor console. If it fails to load, `gfx` stays
+-- nil and trendGlyph's ASCII "^"/"v"/"-" rendering is used unchanged.
+local okGfx, gfxModule = pcall(dofile, "/lib/gfx.lua")
+local gfx = okGfx and gfxModule or nil
+if not okGfx then
+    print("[SUP] WARNING: failed to load /lib/gfx.lua: " .. tostring(gfxModule) ..
+          " - trend indicators will render as plain ASCII")
+end
+
 local NET    = config.NETWORK
 local MSG    = config.NETWORK.MSG_TYPE
 local SP     = config.SETPOINTS

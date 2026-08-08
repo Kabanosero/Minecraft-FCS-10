@@ -118,6 +118,18 @@ if not okRbac then
           " - SET_BURN_RATE/APPLY_TAG/REMOVE_TAG/ENTER_TESTING/EXIT_TESTING will be rejected until fixed")
 end
 
+-- gfx (CC:Graphics bar-meter gauges) load is also NON-FATAL, same reasoning
+-- as rbac above: reactor telemetry must never depend on an optional visual
+-- mod. If it fails to load, `gfx` stays nil and drawScadaScreen's gauge
+-- rows fall back to plain text (see the `gfx and gfx.drawBarMeter(...)`
+-- guards below) exactly as if CC:Graphics were simply not installed.
+local okGfx, gfxModule = pcall(dofile, "/lib/gfx.lua")
+local gfx = okGfx and gfxModule or nil
+if not okGfx then
+    print("[PLC] WARNING: failed to load /lib/gfx.lua: " .. tostring(gfxModule) ..
+          " - SCADA gauges will render as plain text")
+end
+
 local NET    = config.NETWORK
 local MSG    = config.NETWORK.MSG_TYPE
 local SP     = config.SETPOINTS
@@ -207,9 +219,69 @@ local STATE_COLOR = {
 
 local homeHitRegion = nil -- HOME button hit-region from the last sub-screen chrome draw
 
+-- ---------------------------------------------------------------------------
+-- SCADA gauge rows - DMG/T-K/CLT/WST as bar-meter gauges (lib/gfx.lua, real
+-- pixels via CC:Graphics if available, a plain "####----" ASCII bar
+-- otherwise - see gfx.drawBarMeter's own fallback contract) instead of the
+-- single flat text line this screen used to show. bandColor picks the same
+-- green/yellow/red severity a real SCADA gauge would, using this file's own
+-- SP.* setpoint bands (config.lua SETPOINTS) rather than inventing new
+-- thresholds - see lib/config.lua for the exact numbers.
+-- ---------------------------------------------------------------------------
+local GAUGE_LABEL_W, GAUGE_VALUE_W = 5, 7
+
+-- `invert=true` means LOWER is worse (coolant%) - everything else here is
+-- HIGHER is worse.
+local function bandColor(value, warn, high, invert)
+    if invert then
+        if value <= high then return colors.red end
+        if value <= warn then return colors.yellow end
+        return colors.green
+    end
+    if value >= high then return colors.red end
+    if value >= warn then return colors.yellow end
+    return colors.green
+end
+
+-- Draws one labeled gauge row at `row`: "LABEL" + a bar-meter spanning the
+-- middle of the line + the exact numeric value right-aligned at the end.
+-- `pct` (0-100, clamped) drives the bar fill; `valueText` is the precise
+-- human-readable value shown regardless of graphics mode - an operator
+-- needs the real number, a bar alone is never precise enough on its own.
+local function drawMetricGauge(w, dataColor, row, label, pct, valueText, fillColor)
+    term.setTextColor(dataColor)
+    term.setCursorPos(1, row)
+    term.write(("%-" .. GAUGE_LABEL_W .. "s"):format(label))
+
+    local gaugeX = GAUGE_LABEL_W + 1
+    local gaugeW = math.max(1, w - gaugeX - GAUGE_VALUE_W - 1)
+    local clamped = math.max(0, math.min(100, pct or 0))
+    local filled = math.floor(gaugeW * clamped / 100 + 0.5)
+    local asciiBar = string.rep("#", filled) .. string.rep("-", gaugeW - filled)
+
+    if gfx then
+        gfx.drawBarMeter(gaugeX, row, gaugeW, 1, clamped, fillColor, colors.gray, asciiBar)
+    else
+        term.setCursorPos(gaugeX, row)
+        term.setTextColor(fillColor)
+        term.write(asciiBar)
+    end
+
+    term.setTextColor(dataColor)
+    term.setCursorPos(w - GAUGE_VALUE_W + 1, row)
+    term.write(("%" .. GAUGE_VALUE_W .. "s"):format(valueText))
+end
+
 local function drawScadaScreen()
     local w, h = term.getSize()
     local theme = os_shell.THEME
+
+    -- Leaving graphics mode is also handled unconditionally at the top of
+    -- draw() (see below) - this call here is what actually turns it back ON
+    -- for this specific screen's gauge rows.
+    if gfx then
+        gfx.beginFrame()
+    end
 
     term.setBackgroundColor(theme.bg)
     term.setTextColor(theme.text)
@@ -235,20 +307,34 @@ local function drawScadaScreen()
     -- dataColor: "fresh" reads as the theme's normal text color, "stale"
     -- stays semantically orange regardless of theme.
     local dataColor = reactorState.online and theme.text or colors.orange
-    term.setTextColor(dataColor)
 
-    term.setCursorPos(1, 4)
-    term.write(("DMG  %5.1f%%   T-K  %5.0f   CLT %5.1f%%  WST %5.1f%%"):format(
-        reactorState.damagePct, reactorState.coreTempK, reactorState.coolantPct, reactorState.wastePct))
+    -- Rows 4-7: DMG/T-K/CLT/WST gauges (was a single flat text line on row
+    -- 4 - the 3 extra rows this now takes push everything below down by
+    -- exactly 3, which is why every row number from here down is +3 versus
+    -- this screen's previous layout; there were already 3 spare blank rows
+    -- at the bottom of a 19-row terminal, so nothing overflows).
+    drawMetricGauge(w, dataColor, 4, "DMG", reactorState.damagePct,
+        ("%.1f%%"):format(reactorState.damagePct),
+        bandColor(reactorState.damagePct, SP.DAMAGE.WARNING, SP.DAMAGE.HIGH_ALARM))
+    drawMetricGauge(w, dataColor, 5, "T-K", reactorState.coreTempK / SP.CORE_TEMP_K.SCRAM * 100,
+        ("%.0fK"):format(reactorState.coreTempK),
+        bandColor(reactorState.coreTempK, SP.CORE_TEMP_K.WARNING, SP.CORE_TEMP_K.HIGH_ALARM))
+    drawMetricGauge(w, dataColor, 6, "CLT", reactorState.coolantPct,
+        ("%.1f%%"):format(reactorState.coolantPct),
+        bandColor(reactorState.coolantPct, SP.COOLANT_PCT.LOW_WARNING, SP.COOLANT_PCT.LOW_ALARM, true))
+    drawMetricGauge(w, dataColor, 7, "WST", reactorState.wastePct,
+        ("%.1f%%"):format(reactorState.wastePct),
+        bandColor(reactorState.wastePct, SP.WASTE_PCT.HIGH_WARNING, SP.WASTE_PCT.HIGH_ALARM))
+    term.setTextColor(dataColor)
 
     local ageText = reactorState.lastUpdate > 0
         and fmtAge(os.epoch("utc") - reactorState.lastUpdate) or "--"
-    term.setCursorPos(1, 5)
+    term.setCursorPos(1, 8)
     term.write(("BURN %5.1f mB/t   HW: %-7s  AGE: %s"):format(
         reactorState.burnRateMbT, peripheralPresent and "PRESENT" or "ABSENT", ageText))
     term.setTextColor(theme.text)
 
-    term.setCursorPos(1, 7)
+    term.setCursorPos(1, 10)
     if lotoTag then
         term.setTextColor(colors.red)
         term.write(("LOTO: TAGGED - %s"):format(lotoTag.reason))
@@ -257,19 +343,19 @@ local function drawScadaScreen()
         term.write("LOTO: none")
     end
 
-    term.setCursorPos(1, 8)
+    term.setCursorPos(1, 11)
     term.write(("TESTING: %-3s  EPG: %-6s  ACT: %s"):format(
         testingMode and "ON" or "off",
         epgActive and "ACTIVE" or "--",
         lastScramActuationConfirmed == nil and "--"
             or (lastScramActuationConfirmed and "CONFIRMED" or "UNCONFIRMED")))
 
-    term.setCursorPos(1, 10)
+    term.setCursorPos(1, 13)
     term.setTextColor(theme.dim)
     term.write("LOG:")
     term.setTextColor(theme.text)
     for i, line in ipairs(uiLog) do
-        local row = 10 + i
+        local row = 13 + i
         if row > h then
             break
         end
@@ -354,6 +440,16 @@ end
 -- local display choice with no effect on the poll/trip logic above (see
 -- module state comment). Screens themselves never sleep or block.
 local function draw()
+    -- Unconditional, every tick, BEFORE branching: guarantees the terminal
+    -- starts this draw from a known text-mode state no matter which screen
+    -- ran last tick (or whether it left graphics mode on because it hit an
+    -- error - see lib/gfx.lua's own doc comment on this exact pattern).
+    -- drawScadaScreen() is the only screen that turns graphics mode back on,
+    -- and only for itself.
+    if gfx then
+        gfx.endFrame()
+    end
+
     if currentScreen == "scada" then
         drawScadaScreen()
     elseif currentScreen == "settings" then
