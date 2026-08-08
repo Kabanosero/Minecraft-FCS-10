@@ -68,15 +68,47 @@ if not okShell then
     return
 end
 
--- gfx (CC:Graphics trend arrows) load is NON-FATAL, same reasoning as every
--- other optional lib in this project: a missing/broken visual mod must
--- never take down the Supervisor console. If it fails to load, `gfx` stays
--- nil and trendGlyph's ASCII "^"/"v"/"-" rendering is used unchanged.
+-- gfx (CC:Graphics gauges/pixel-text/trend arrows) load is NON-FATAL, same
+-- reasoning as every other optional lib in this project: a missing/broken
+-- visual mod must never take down the Supervisor console. gfxLoadFailed is
+-- tracked separately from `gfx` itself: if the real module fails to load,
+-- `gfx` is reassigned below to a minimal shim mimicking its own text-mode
+-- fallback behavior (same call signatures, always routes to plain
+-- term.write) - see nodes/plc.lua's identical load block for the full
+-- reasoning (drawConsoleScreen never needs a separate "gfx missing
+-- entirely" branch this way; only drawNetworkScreen's diagnostic checks
+-- gfxLoadFailed directly, to tell the operator the two failure cases apart).
+-- The shim also covers drawTrendArrow/drawStatusLed (drawRoleTab below calls
+-- both directly, not just drawText/drawBarMeter) - each mirrors the real
+-- module's own text-mode fallback exactly.
 local okGfx, gfxModule = pcall(dofile, "/lib/gfx.lua")
+local gfxLoadFailed = not okGfx
 local gfx = okGfx and gfxModule or nil
-if not okGfx then
+if gfxLoadFailed then
     print("[SUP] WARNING: failed to load /lib/gfx.lua: " .. tostring(gfxModule) ..
-          " - trend indicators will render as plain ASCII")
+          " - console will render as plain text")
+    local FALLBACK_ARROW = { up = "^", down = "v", flat = "-" }
+    gfx = {
+        beginFrame = function() return false end,
+        endFrame   = function() end,
+        clear      = function(bg) term.setBackgroundColor(bg); term.clear() end,
+        drawText   = function(x, y, text, fg, bg)
+            term.setCursorPos(x, y)
+            if bg then term.setBackgroundColor(bg) end
+            term.setTextColor(fg or colors.white)
+            term.write(tostring(text or ""))
+        end,
+        drawTrendArrow = function(x, y, direction, color)
+            term.setCursorPos(x, y)
+            term.setTextColor(color or colors.white)
+            term.write(FALLBACK_ARROW[direction] or "-")
+        end,
+        drawStatusLed = function(x, y, color, fallbackChar)
+            term.setCursorPos(x, y)
+            term.setTextColor(color or colors.white)
+            term.write(fallbackChar or "*")
+        end,
+    }
 end
 
 local NET    = config.NETWORK
@@ -134,16 +166,19 @@ local TREND_EPS = { damagePct = 0.1, coreTempK = 1, coolantPct = 0.5, wastePct =
 -- hitTestButtons *pattern*, not the palette itself) - so this screen's
 -- buttons stay in sync with whatever theme Settings has switched to,
 -- instead of being stuck on one fixed palette forever.
+-- Routed through gfx.drawText (one call, the button's full width pre-padded
+-- with spaces around the centered label) rather than two separate
+-- term.write calls, so this button survives graphics mode on the console
+-- screen the same way nodes/plc.lua's/nodes/rtu.lua's gauge rows do - see
+-- drawConsoleScreen below for why that matters.
 local function drawButton(btn, selected)
     local theme = os_shell.THEME
-    term.setBackgroundColor(selected and colors.white or theme[btn.colorKey])
-    term.setTextColor(selected and colors.black or theme.text)
-    term.setCursorPos(btn.x, btn.y)
-    term.write(string.rep(" ", btn.width))
-    term.setCursorPos(btn.x + math.floor((btn.width - #btn.label) / 2), btn.y)
-    term.write(btn.label)
-    term.setBackgroundColor(theme.bg)
-    term.setTextColor(theme.text)
+    local bg = selected and colors.white or theme[btn.colorKey]
+    local fg = selected and colors.black or theme.text
+    local pad = math.max(0, btn.width - #btn.label)
+    local leftPad = math.floor(pad / 2)
+    local text = string.rep(" ", leftPad) .. btn.label .. string.rep(" ", pad - leftPad)
+    gfx.drawText(btn.x, btn.y, text, fg, bg)
 end
 
 local function hitTestButtons(buttons, x, y)
@@ -694,17 +729,23 @@ local function fmtAge(ms)
     return string.format("%.0fm", s / 60)
 end
 
-local function trendGlyph(prev, cur, eps)
+-- Returns "up"/"down"/"flat" (gfx.drawTrendArrow's direction argument -
+-- itself already falls back to the equivalent ASCII "^"/"v"/"-" glyph when
+-- graphics mode isn't active, so callers below never need their own text
+-- fallback) or nil when there's no previous sample yet to compare against -
+-- the caller draws a blank cell for that case rather than calling
+-- gfx.drawTrendArrow with a bogus direction.
+local function trendDirection(prev, cur, eps)
     if prev == nil or cur == nil then
-        return " "
+        return nil
     end
     local d = cur - prev
     if d > eps then
-        return "^"
+        return "up"
     elseif d < -eps then
-        return "v"
+        return "down"
     end
-    return "-"
+    return "flat"
 end
 
 local function formatCommandStatus(pend)
@@ -744,34 +785,23 @@ local function drawTabBar(w)
     lastRenderedTabs = {}
     local x = 1
 
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.lightBlue)
-    term.setCursorPos(x, 2)
-    term.write(HOME_TAB_LABEL)
+    gfx.drawText(x, 2, HOME_TAB_LABEL, colors.lightBlue, colors.gray)
     lastRenderedTabs[#lastRenderedTabs + 1] = { id = "__HOME__", x = x, y = 2, width = #HOME_TAB_LABEL }
     x = x + #HOME_TAB_LABEL
 
     for _, tab in ipairs(TABS) do
         local label = " " .. tab .. " "
         if tab == currentTab then
-            term.setBackgroundColor(colors.white)
-            term.setTextColor(colors.black)
+            gfx.drawText(x, 2, label, colors.black, colors.white)
         else
-            term.setBackgroundColor(colors.gray)
-            term.setTextColor(colors.lightGray)
+            gfx.drawText(x, 2, label, colors.lightGray, colors.gray)
         end
-        term.setCursorPos(x, 2)
-        term.write(label)
         lastRenderedTabs[#lastRenderedTabs + 1] = { id = tab, x = x, y = 2, width = #label }
         x = x + #label
     end
-    term.setBackgroundColor(colors.gray)
-    term.setTextColor(colors.white)
     if x <= w then
-        term.write(string.rep(" ", w - x + 1))
+        gfx.drawText(x, 2, string.rep(" ", w - x + 1), colors.white, colors.gray)
     end
-    term.setBackgroundColor(os_shell.THEME.bg)
-    term.setTextColor(os_shell.THEME.text)
 end
 
 -- SVR tab: the system-wide summary that used to occupy rows 2-6 of the old
@@ -801,57 +831,47 @@ local function drawSvrTab(w)
     end
 
     local status = aggregateStatus()
-    term.setCursorPos(1, 3)
-    term.setBackgroundColor(STATUS_COLOR[status] or colors.gray)
-    term.setTextColor(colors.black)
     local headerLine = (" SYSTEM: %s  (%d PLC%s, %d offline) "):format(
         status, plcCount, plcCount == 1 and "" or "s", offlineCount)
-    term.write(headerLine .. string.rep(" ", math.max(0, w - #headerLine)))
-    term.setBackgroundColor(os_shell.THEME.bg)
-    term.setTextColor(os_shell.THEME.text)
+    headerLine = headerLine .. string.rep(" ", math.max(0, w - #headerLine))
+    gfx.drawText(1, 3, headerLine, colors.black, STATUS_COLOR[status] or colors.gray)
 
-    term.setCursorPos(1, 4)
-    term.write(("HB TX: %s ago (%ds cadence)"):format(fmtAge(os.epoch("utc") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S))
+    gfx.drawText(1, 4, ("HB TX: %s ago (%ds cadence)"):format(
+        fmtAge(os.epoch("utc") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S), os_shell.THEME.text, os_shell.THEME.bg)
 
     -- Surfaces secnetOpen (tracked for tryOpenSecnet's retry logic - see
     -- module state above) directly to the operator: a Supervisor stuck
     -- unable to open its own modem is the single worst failure mode in
     -- this whole project (every PLC fail-safe SCRAMs once it can't hear a
     -- heartbeat), so it deserves to be visible here, not just in the log.
-    term.setCursorPos(1, 5)
-    term.write("MODEM: ")
+    gfx.drawText(1, 5, "MODEM: ", os_shell.THEME.text, os_shell.THEME.bg)
     if secnetOpen then
-        term.setTextColor(colors.green)
-        term.write("OPEN")
+        gfx.drawText(8, 5, "OPEN", colors.green, os_shell.THEME.bg)
     else
-        term.setTextColor(colors.red)
-        term.write("NOT OPEN (retrying)")
+        gfx.drawText(8, 5, "NOT OPEN (retrying)", colors.red, os_shell.THEME.bg)
     end
-    term.setTextColor(os_shell.THEME.text)
 
-    term.setCursorPos(1, 6)
-    term.write("CMD: " .. formatCommandStatus(lastCommandRef))
+    gfx.drawText(1, 6, "CMD: " .. formatCommandStatus(lastCommandRef), os_shell.THEME.text, os_shell.THEME.bg)
 
-    term.setCursorPos(1, 7)
+    local scramLine
     if lastScramGlobal then
         local scramPlc = plcs[lastScramGlobal.plcId]
         local epgNote = (scramPlc and scramPlc.epgActive) and " (EPG ACTIVE)" or ""
-        term.write(("LAST SCRAM: #%d %s ago - %s (%s)%s"):format(
+        scramLine = ("LAST SCRAM: #%d %s ago - %s (%s)%s"):format(
             lastScramGlobal.plcId, fmtAge(os.epoch("utc") - lastScramGlobal.receivedAt),
             tostring(lastScramGlobal.reason),
             lastScramGlobal.actuationConfirmed and "CONFIRMED" or "UNCONFIRMED",
-            epgNote))
+            epgNote)
     else
-        term.write("LAST SCRAM: none yet")
+        scramLine = "LAST SCRAM: none yet"
     end
+    gfx.drawText(1, 7, scramLine, os_shell.THEME.text, os_shell.THEME.bg)
 
-    term.setCursorPos(1, 8)
     if lotoCount > 0 then
-        term.setTextColor(colors.red)
-        term.write(("LOTO: %d reactor%s tagged"):format(lotoCount, lotoCount == 1 and "" or "s"))
-        term.setTextColor(os_shell.THEME.text)
+        gfx.drawText(1, 8, ("LOTO: %d reactor%s tagged"):format(lotoCount, lotoCount == 1 and "" or "s"),
+            colors.red, os_shell.THEME.bg)
     else
-        term.write("LOTO: none active")
+        gfx.drawText(1, 8, "LOTO: none active", os_shell.THEME.text, os_shell.THEME.bg)
     end
 end
 
@@ -883,8 +903,8 @@ local function drawRoleTab(h, predicate, showButtons)
     -- "ID  " (4 chars, matches "#%-3d") + 2 glyph columns (LOTO "L", Testing
     -- "T", 1 char each) + "STATE" (10 chars, matches "%-10s") = 16 chars
     -- before EAL, matching the per-row writes below exactly.
-    term.setCursorPos(1, tableTop)
-    term.write("ID    STATE     EAL  DMG%   T-K   CLT%  WST%  BURN  AGE")
+    gfx.drawText(1, tableTop, "ID    STATE     EAL  DMG%   T-K   CLT%  WST%  BURN  AGE",
+        os_shell.THEME.text, os_shell.THEME.bg)
 
     -- Sort worst-first so that on a truncated screen the rows most worth an
     -- operator's attention are always the ones still visible.
@@ -917,84 +937,132 @@ local function drawRoleTab(h, predicate, showButtons)
     lastRenderedRows = {}
     lastRenderedTableTop = tableTop
 
+    -- Column start positions below are derived directly from the ORIGINAL
+    -- term.write format widths (e.g. DMG's old "%5.1f%s " was a 5-char
+    -- number + 1-char trend glyph + 1 trailing space = 7 total), so this
+    -- reproduces the exact layout sequential term.write calls used to
+    -- produce - gfx.drawText has no persistent cursor, so every call needs
+    -- its own explicit column instead of just continuing where the last one
+    -- left off. Do not try to line these up with the header string above -
+    -- that's a hand-typed literal, independent of this math.
     for i = 1, shown do
         local plcId = rows[i]
         local rec = plcs[plcId]
         local s, prev = rec.state, rec.prevState
         local online = isOnline(rec)
+        local row = tableTop + i
 
         lastRenderedRows[i] = plcId
 
-        term.setCursorPos(1, tableTop + i)
-        if plcId == selectedPlcId then
-            -- Selection highlight: inverted colors on the ID cell only,
-            -- so the operator can see the current click-target at a glance.
-            term.setBackgroundColor(colors.white)
-            term.setTextColor(colors.black)
-        else
-            term.setTextColor(online and os_shell.THEME.text or colors.orange)
-        end
         -- "R" prefix instead of "#" for an RTU row - kept even though each
         -- tab is now role-pure, so a row's own identity stays legible if
-        -- it's ever screenshotted/logged out of context.
-        term.write(string.format("%s%-3d", rec.role == "RTU" and "R" or "#", plcId))
-        term.setBackgroundColor(os_shell.THEME.bg)
-
-        -- LOTO / Testing glyphs: last-known value shown regardless of
-        -- `online`, same as every other data column (stale-but-last-known
-        -- beats blank while offline, per this project's stated philosophy).
-        term.setTextColor(colors.red)
-        term.write(rec.loto and "L" or " ")
-        term.setTextColor(colors.yellow)
-        term.write(rec.testingMode and "T" or " ")
-
-        if s.plantState == STATES.SCRAMMED then
-            term.setTextColor(colors.red)
-        elseif s.plantState == STATES.ANOMALY then
-            term.setTextColor(colors.orange)
+        -- it's ever screenshotted/logged out of context. Selection
+        -- highlight: inverted colors on the ID cell only, so the operator
+        -- can see the current click-target at a glance.
+        local idText = string.format("%s%-3d", rec.role == "RTU" and "R" or "#", plcId)
+        if plcId == selectedPlcId then
+            gfx.drawText(1, row, idText, colors.black, colors.white)
         else
-            term.setTextColor(online and os_shell.THEME.text or colors.orange)
+            gfx.drawText(1, row, idText, online and os_shell.THEME.text or colors.orange, os_shell.THEME.bg)
+        end
+
+        -- LOTO / Testing indicators: small filled status LEDs (real pixels
+        -- via CC:Graphics, a plain "L"/"T" letter otherwise - see
+        -- gfx.drawStatusLed's own fallback contract) rather than a letter
+        -- always drawn as text - each column's fixed position already tells
+        -- the operator which flag it is, same as the letter did. Last-known
+        -- value shown regardless of `online`, same as every other data
+        -- column (stale-but-last-known beats blank while offline, per this
+        -- project's stated philosophy).
+        if rec.loto then
+            gfx.drawStatusLed(5, row, colors.red, "L")
+        else
+            gfx.drawText(5, row, " ", os_shell.THEME.text, os_shell.THEME.bg)
+        end
+        if rec.testingMode then
+            gfx.drawStatusLed(6, row, colors.yellow, "T")
+        else
+            gfx.drawText(6, row, " ", os_shell.THEME.text, os_shell.THEME.bg)
+        end
+
+        local stateColor
+        if s.plantState == STATES.SCRAMMED then
+            stateColor = colors.red
+        elseif s.plantState == STATES.ANOMALY then
+            stateColor = colors.orange
+        else
+            stateColor = online and os_shell.THEME.text or colors.orange
         end
         local stateText = s.plantState
         if s.plantState == STATES.NORMAL and rec.operatingMode then
             stateText = OPERATING_MODE_ABBR[rec.operatingMode] or s.plantState
         end
-        term.write(string.format("%-10s", tostring(stateText or "?")))
+        gfx.drawText(7, row, string.format("%-10s", tostring(stateText or "?")), stateColor, os_shell.THEME.bg)
 
         local ealColor = rec.activeEAL and TIER_BY_ID[rec.activeEAL] and colors[TIER_BY_ID[rec.activeEAL].color]
-        term.setTextColor(ealColor or (online and os_shell.THEME.text or colors.orange))
-        term.write(string.format("%-5s", rec.activeEAL or "--"))
+        gfx.drawText(17, row, string.format("%-5s", rec.activeEAL or "--"),
+            ealColor or (online and os_shell.THEME.text or colors.orange), os_shell.THEME.bg)
 
-        term.setTextColor(online and os_shell.THEME.text or colors.orange)
-        term.write(string.format("%5.1f%s ", s.damagePct or 0, trendGlyph(prev and prev.damagePct, s.damagePct, TREND_EPS.damagePct)))
-        term.write(string.format("%5.0f%s ", s.coreTempK or 0, trendGlyph(prev and prev.coreTempK, s.coreTempK, TREND_EPS.coreTempK)))
-        term.write(string.format("%4.1f%s ", s.coolantPct or 0, trendGlyph(prev and prev.coolantPct, s.coolantPct, TREND_EPS.coolantPct)))
-        term.write(string.format("%4.1f%s ", s.wastePct or 0, trendGlyph(prev and prev.wastePct, s.wastePct, TREND_EPS.wastePct)))
-        term.write(string.format("%4.0f ", s.burnRateMbT or 0))
+        -- Each metric: the exact numeric value (gfx.drawText) plus a real
+        -- pixel trend arrow (gfx.drawTrendArrow - falls back to the
+        -- equivalent ASCII "^"/"v"/"-" glyph on its own when graphics mode
+        -- isn't active, so no separate text fallback is needed here) in the
+        -- single character cell right after the number, matching where the
+        -- old "%s" glyph placeholder sat in the original format string.
+        -- trendDirection returning nil (no previous sample yet) draws a
+        -- blank cell instead of calling gfx.drawTrendArrow with a bogus
+        -- direction - preserves the original blank-not-dash behavior for a
+        -- PLC's very first reading.
+        local dataColor = online and os_shell.THEME.text or colors.orange
+
+        local function metric(col, numFmt, value, prevValue, eps)
+            local numText = numFmt:format(value or 0)
+            gfx.drawText(col, row, numText, dataColor, os_shell.THEME.bg)
+            local dir = trendDirection(prevValue, value, eps)
+            local arrowCol = col + #numText
+            if dir then
+                gfx.drawTrendArrow(arrowCol, row, dir, dataColor)
+            else
+                gfx.drawText(arrowCol, row, " ", dataColor, os_shell.THEME.bg)
+            end
+        end
+
+        metric(22, "%5.1f", s.damagePct, prev and prev.damagePct, TREND_EPS.damagePct)
+        metric(29, "%5.0f", s.coreTempK, prev and prev.coreTempK, TREND_EPS.coreTempK)
+        metric(36, "%4.1f", s.coolantPct, prev and prev.coolantPct, TREND_EPS.coolantPct)
+        metric(42, "%4.1f", s.wastePct, prev and prev.wastePct, TREND_EPS.wastePct)
+
+        gfx.drawText(48, row, string.format("%4.0f ", s.burnRateMbT or 0), dataColor, os_shell.THEME.bg)
 
         if online then
-            term.write(fmtAge(os.epoch("utc") - rec.lastTelemetryTs))
+            gfx.drawText(53, row, fmtAge(os.epoch("utc") - rec.lastTelemetryTs), dataColor, os_shell.THEME.bg)
         else
-            term.setTextColor(colors.orange)
-            term.write("OFFLINE")
+            gfx.drawText(53, row, "OFFLINE", colors.orange, os_shell.THEME.bg)
         end
     end
-    term.setTextColor(os_shell.THEME.text)
 
     if #rows > shown then
-        term.setCursorPos(1, tableTop + shown + 1)
-        term.setTextColor(colors.gray)
-        term.write(("+%d more (all lower severity)"):format(#rows - shown))
-        term.setTextColor(os_shell.THEME.text)
+        gfx.drawText(1, tableTop + shown + 1, ("+%d more (all lower severity)"):format(#rows - shown),
+            colors.gray, os_shell.THEME.bg)
     end
 end
 
 -- The pre-existing SVR/PLC/RTU tabbed view, now one of four top-level
 -- screens (see "DESKTOP SHELL" below) rather than the only thing this file
--- ever draws. Body unchanged from the original redraw().
+-- ever draws. Drawn ENTIRELY through gfx.drawText/gfx.drawTrendArrow/
+-- gfx.drawStatusLed (real pixels via CC:Graphics when available, plain text
+-- otherwise), never a bare term.write - same reasoning as nodes/plc.lua's/
+-- nodes/rtu.lua's SCADA screens: CC:Graphics' graphics mode is a confirmed
+-- whole-screen toggle, so a screen that wants real trend arrows has to draw
+-- literally everything else on it (tab bar, header, every table cell) as
+-- pixels too, or graphics mode blanks the rest. gfx.beginFrame() here is
+-- what actually turns that on when CC:Graphics is present; every gfx.* call
+-- below still silently falls back to today's plain text otherwise.
 local function drawConsoleScreen(w, h)
-    term.setCursorPos(1, 1)
-    term.write(("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()))
+    gfx.beginFrame()
+    gfx.clear(os_shell.THEME.bg)
+
+    gfx.drawText(1, 1, ("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()), os_shell.THEME.text, os_shell.THEME.bg)
 
     drawTabBar(w)
 
@@ -1074,7 +1142,7 @@ local function drawNetworkScreen()
         { label = "HB sent",    value = fmtAge(os.epoch("utc") - lastHeartbeatSentAt) .. " ago" },
         { label = "HB cadence", value = NET.HEARTBEAT_INTERVAL_S .. "s" },
     }
-    if gfx then
+    if not gfxLoadFailed then
         local d = gfx.diagnose()
         diagRows[#diagRows + 1] = { label = "CC:Graphics", value = d.available and "AVAILABLE" or "NOT AVAILABLE",
             color = d.available and colors.green or colors.red }
@@ -1140,13 +1208,24 @@ end
 local function redraw()
     local w, h = term.getSize()
 
+    -- Unconditional, every tick, BEFORE branching - same pattern as
+    -- nodes/plc.lua's/nodes/rtu.lua's draw() dispatcher: guarantees a known
+    -- text-mode state no matter which screen ran last tick. drawConsoleScreen()
+    -- is the only screen that turns graphics mode back on, and only for
+    -- itself (it does its own gfx.clear() instead of the generic
+    -- term.clear() below - see its own header comment).
+    gfx.endFrame()
+
+    if currentScreen == "console" then
+        drawConsoleScreen(w, h)
+        return
+    end
+
     term.setBackgroundColor(os_shell.THEME.bg)
     term.setTextColor(os_shell.THEME.text)
     term.clear()
 
-    if currentScreen == "console" then
-        drawConsoleScreen(w, h)
-    elseif currentScreen == "settings" then
+    if currentScreen == "settings" then
         drawSettingsScreen()
     elseif currentScreen == "network" then
         drawNetworkScreen()
