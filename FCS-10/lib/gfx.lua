@@ -381,6 +381,51 @@ function gfx.clear(bgColor)
 end
 
 -- ---------------------------------------------------------------------------
+-- gfx.drawBevel - a flat filled rectangle (character-cell x, y, w, h, same
+-- units as gfx.drawBarMeter) with a 1px light highlight along its top+left
+-- edge and a 1px dark shadow along its bottom+right edge - the classic
+-- Windows 95 / Netscape 4 "raised button" look, built from the same solid-
+-- fill drawPixels calls already confirmed working for the bar meters (see
+-- header). Falls back to a plain filled rectangle with no bevel in text
+-- mode - a sub-character pixel edge has no text-mode equivalent, same
+-- "graceful degradation, not graceful imitation" contract every other
+-- function here already uses.
+-- ---------------------------------------------------------------------------
+function gfx.drawBevel(x, y, w, h, bg, highlight, shadow)
+    if not (inFrame and available()) then
+        for row = 0, h - 1 do
+            term.setCursorPos(x, y + row)
+            term.setBackgroundColor(bg)
+            term.write(string.rep(" ", w))
+        end
+        return false
+    end
+
+    local px = (x - 1) * PX_PER_COL
+    local py = (y - 1) * PX_PER_ROW
+    local pw = w * PX_PER_COL
+    local ph = h * PX_PER_ROW
+
+    local ok = pcall(function()
+        term.drawPixels(px, py, bg, pw, ph)
+        term.drawPixels(px, py, highlight, pw - 1, 1)   -- top edge
+        term.drawPixels(px, py, highlight, 1, ph - 1)   -- left edge
+        term.drawPixels(px, py + ph - 1, shadow, pw, 1) -- bottom edge
+        term.drawPixels(px + pw - 1, py, shadow, 1, ph) -- right edge
+    end)
+
+    if not ok then
+        for row = 0, h - 1 do
+            term.setCursorPos(x, y + row)
+            term.setBackgroundColor(bg)
+            term.write(string.rep(" ", w))
+        end
+        return false
+    end
+    return true
+end
+
+-- ---------------------------------------------------------------------------
 -- Trend arrow - a small filled triangle inside a SINGLE character cell (so
 -- it drops into a column that today holds one ASCII glyph, e.g.
 -- supervisor.lua's trendGlyph "^"/"v"/"-", with no layout/column-width

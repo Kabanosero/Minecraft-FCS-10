@@ -108,6 +108,13 @@ if gfxLoadFailed then
             term.setTextColor(color or colors.white)
             term.write(fallbackChar or "*")
         end,
+        drawBevel = function(x, y, w, h, bg)
+            for row = 0, h - 1 do
+                term.setCursorPos(x, y + row)
+                term.setBackgroundColor(bg)
+                term.write(string.rep(" ", w))
+            end
+        end,
     }
 end
 
@@ -131,6 +138,31 @@ local STATUS_COLOR = {
     WARNING          = colors.yellow,
     SCRAMMED         = colors.red,
     DISCONNECTED     = colors.orange,
+}
+
+-- ---------------------------------------------------------------------------
+-- CHROME - a retro-browser-window palette (Netscape 4 / Windows 95 raised-
+-- button chrome) for the CONSOLE screen only, via drawConsoleScreen below.
+-- Deliberately separate from os_shell.THEME: the shared theme (still black
+-- bg / white text) is what every OTHER screen on every node still uses
+-- (desktop/Settings/Network/SCADA) - this is a one-screen aesthetic choice,
+-- not a new site-wide theme, so it gets its own local table rather than a
+-- new os_shell.THEMES entry. Content-area text still uses the SAME semantic
+-- colors as before (colors.red/orange/green/yellow for status/EAL/stale-
+-- data - see drawSvrTab/drawRoleTab below) since those read fine against a
+-- light background too; only the "normal, nothing special" text/background
+-- pair changes from white-on-black to contentText-on-contentBg.
+-- ---------------------------------------------------------------------------
+local CHROME = {
+    titleBg     = colors.blue,
+    titleText   = colors.white,
+    barBg       = colors.lightGray,  -- menu bar / toolbar / status bar
+    barText     = colors.black,
+    barDim      = colors.gray,       -- disabled toolbar buttons / secondary status text
+    locBg       = colors.white,      -- location bar "field"
+    locText     = colors.black,
+    contentBg   = colors.lightGray,
+    contentText = colors.black,
 }
 
 -- Short display abbreviations for config.OPERATING_MODES, fit to the
@@ -166,19 +198,20 @@ local TREND_EPS = { damagePct = 0.1, coreTempK = 1, coolantPct = 0.5, wastePct =
 -- hitTestButtons *pattern*, not the palette itself) - so this screen's
 -- buttons stay in sync with whatever theme Settings has switched to,
 -- instead of being stuck on one fixed palette forever.
--- Routed through gfx.drawText (one call, the button's full width pre-padded
--- with spaces around the centered label) rather than two separate
--- term.write calls, so this button survives graphics mode on the console
--- screen the same way nodes/plc.lua's/nodes/rtu.lua's gauge rows do - see
--- drawConsoleScreen below for why that matters.
+-- Routed through gfx.drawBevel (raised-button chrome, matching the retro
+-- toolbar look - see drawConsoleScreen/drawToolbar) + gfx.drawText (label
+-- only, no background fill of its own - the bevel already painted one)
+-- rather than a plain filled rectangle, so this button survives graphics
+-- mode on the console screen the same way nodes/plc.lua's/nodes/rtu.lua's
+-- gauge rows do, and now LOOKS like the rest of the console's chrome too.
 local function drawButton(btn, selected)
     local theme = os_shell.THEME
     local bg = selected and colors.white or theme[btn.colorKey]
     local fg = selected and colors.black or theme.text
+    gfx.drawBevel(btn.x, btn.y, btn.width, 1, bg, colors.white, colors.gray)
     local pad = math.max(0, btn.width - #btn.label)
     local leftPad = math.floor(pad / 2)
-    local text = string.rep(" ", leftPad) .. btn.label .. string.rep(" ", pad - leftPad)
-    gfx.drawText(btn.x, btn.y, text, fg, bg)
+    gfx.drawText(btn.x + leftPad, btn.y, btn.label, fg, nil)
 end
 
 local function hitTestButtons(buttons, x, y)
@@ -208,9 +241,10 @@ local selectedPlcId        = nil -- clicked PLC row, target of the click-only ac
 local lastRenderedRows      = {}
 local lastRenderedTableTop  = nil
 local lastRenderedButtons   = {}
-local lastRenderedTabs      = {} -- tab bar bounds, same capture pattern as lastRenderedButtons
+local lastRenderedToolbar   = {} -- BACK/FORWARD/HOME/RELOAD/etc. hit regions, same capture pattern
+local lastRenderedCloseBox  = nil -- title bar's "X" -> desktop, same capture pattern
 
--- Which of the 3 tabs (see TABS/drawTabBar below) is currently showing.
+-- Which of the 3 pages (see TABS/cycleTab below) is currently showing.
 -- "SVR" is the landing tab: an operator's first question on opening this
 -- screen is "is everything OK overall", not "show me every PLC row" -
 -- matches aggregateStatus()'s own role as the single system-wide verdict.
@@ -764,43 +798,130 @@ local function formatCommandStatus(pend)
 end
 
 -- ---------------------------------------------------------------------------
--- Tab bar (SVR / PLC / RTU) - row 2, directly under the title. Splitting
--- what used to be one flat screen (5 summary lines + one mixed PLC+RTU
--- table, all fighting for the same rows) into per-category tabs gives each
--- one the whole body of the terminal instead: SVR is the "is everything OK"
--- overview, PLC and RTU are each a dedicated, undiluted table for their own
--- role - and an RTU (no trip/protective authority - see plcBucket() above)
--- no longer visually competes with real PLCs for table rows on a small
--- terminal even though it's already excluded from the PLC count/status.
+-- Retro browser chrome (Netscape 4-style) - title bar / menu bar / toolbar /
+-- location bar, rows 1-4, replacing the old flat SVR/PLC/RTU tab strip.
+-- SVR/PLC/RTU are still the exact same 3 pages (see TABS) - what changed is
+-- how you get between them: a real tab strip became a browser's own
+-- BACK/FORWARD (cycle through TABS in order, wrapping) + HOME (jump
+-- straight to SVR, this console's own "home page" - matches SVR's existing
+-- role as the landing tab, see drawSvrTab's own comment). RELOAD is a real
+-- (if trivial) action - forces an immediate redraw. EDIT/IMAGES/OPEN/PRINT/
+-- FIND/STOP are decorative-disabled, same as a real browser grays out
+-- actions with nothing to act on right now; the File/Edit/View/... menu bar
+-- below is entirely decorative (no working menus - a real dropdown menu
+-- system is out of scope here, and a menu bar that LOOKS clickable but
+-- silently does nothing would be worse than one that's honestly just
+-- flavor). The title bar's right-hand close box is the one remaining way
+-- back to the desktop shell (closing the "browser" returns you to the
+-- "OS") - same role the old tab strip's "<HOME " entry played.
 -- ---------------------------------------------------------------------------
 local TABS = { "SVR", "PLC", "RTU" }
 
--- Prepended to the tab bar as a distinct, non-TABS entry (id "__HOME__") so
--- there's a way back out to the desktop shell without disturbing the
--- existing SVR/PLC/RTU tab-switch logic, which only ever needs to
--- recognize real TABS ids.
-local HOME_TAB_LABEL = " <HOME "
-
-local function drawTabBar(w)
-    lastRenderedTabs = {}
-    local x = 1
-
-    gfx.drawText(x, 2, HOME_TAB_LABEL, colors.lightBlue, colors.gray)
-    lastRenderedTabs[#lastRenderedTabs + 1] = { id = "__HOME__", x = x, y = 2, width = #HOME_TAB_LABEL }
-    x = x + #HOME_TAB_LABEL
-
-    for _, tab in ipairs(TABS) do
-        local label = " " .. tab .. " "
-        if tab == currentTab then
-            gfx.drawText(x, 2, label, colors.black, colors.white)
-        else
-            gfx.drawText(x, 2, label, colors.lightGray, colors.gray)
+local function cycleTab(delta)
+    local idx = 1
+    for i, t in ipairs(TABS) do
+        if t == currentTab then
+            idx = i
+            break
         end
-        lastRenderedTabs[#lastRenderedTabs + 1] = { id = tab, x = x, y = 2, width = #label }
-        x = x + #label
     end
-    if x <= w then
-        gfx.drawText(x, 2, string.rep(" ", w - x + 1), colors.white, colors.gray)
+    idx = ((idx - 1 + delta) % #TABS) + 1
+    currentTab = TABS[idx]
+    -- Same reasoning as the old tab strip's switch handler: a stale
+    -- selectedPlcId pointing at a row from the page just left is more
+    -- confusing than just asking the operator to reselect.
+    selectedPlcId = nil
+end
+
+local CLOSE_BOX_LABEL = " X "
+
+local function drawTitleBar(w)
+    local title = ("FCS-10 SUPERVISOR #%d - Netscape"):format(os.getComputerID())
+    local closeX = w - #CLOSE_BOX_LABEL + 1
+    if #title > closeX - 2 then
+        title = title:sub(1, math.max(0, closeX - 2))
+    end
+    gfx.drawText(1, 1, " " .. title .. string.rep(" ", math.max(0, closeX - 2 - #title)), CHROME.titleText, CHROME.titleBg)
+    gfx.drawBevel(closeX, 1, #CLOSE_BOX_LABEL, 1, CHROME.barBg, colors.white, CHROME.barDim)
+    gfx.drawText(closeX + 1, 1, "X", colors.black, nil)
+    lastRenderedCloseBox = { x = closeX, y = 1, width = #CLOSE_BOX_LABEL }
+end
+
+-- Decorative only - see this section's header comment. Truncated to `w`
+-- rather than left to overflow: gfx.drawText draws real pixels past the
+-- edge of the visible canvas in graphics mode with unconfirmed behavior
+-- (see lib/gfx.lua's own "never assert an unverified engine fact" rule),
+-- so every full-width string in this file is clamped defensively, not just
+-- the ones that visibly needed it before.
+local MENU_BAR_TEXT = " File  Edit  View  Go  Bookmarks  Options  Directory  Window  Help"
+
+local function drawMenuBar(w)
+    local text = MENU_BAR_TEXT
+    if #text > w then
+        text = text:sub(1, w)
+    end
+    gfx.drawText(1, 2, text .. string.rep(" ", math.max(0, w - #text)), CHROME.barText, CHROME.barBg)
+end
+
+-- id="back"/"forward" cycle TABS; id="home" jumps to SVR; id="reload" forces
+-- a redraw (trivial but real - safeRedraw() already runs after every click
+-- regardless, so this is honest rather than a total no-op pretending to be
+-- one); the rest are permanently disabled (grayed label, still a real
+-- bevel) - decorative, same reasoning as the menu bar above.
+local TOOLBAR_BUTTONS = {
+    { id = "back",    label = "BACK",    width = 6, enabled = true  },
+    { id = "forward", label = "FORWARD", width = 9, enabled = true  },
+    { id = "home",    label = "HOME",    width = 6, enabled = true  },
+    { id = "edit",    label = "EDIT",    width = 6, enabled = false },
+    { id = "reload",  label = "RELOAD",  width = 8, enabled = true  },
+    { id = "stop",    label = "STOP",    width = 6, enabled = false },
+}
+
+local function drawToolbar(w)
+    gfx.drawText(1, 3, string.rep(" ", w), CHROME.barText, CHROME.barBg)
+    lastRenderedToolbar = {}
+    local x = 1
+    for _, def in ipairs(TOOLBAR_BUTTONS) do
+        if x + def.width - 1 > w then
+            break
+        end
+        gfx.drawBevel(x, 3, def.width, 1, CHROME.barBg, colors.white, CHROME.barDim)
+        local pad = math.max(0, def.width - #def.label)
+        local leftPad = math.floor(pad / 2)
+        gfx.drawText(x + leftPad, 3, def.label, def.enabled and CHROME.barText or CHROME.barDim, nil)
+        lastRenderedToolbar[#lastRenderedToolbar + 1] = { id = def.id, x = x, y = 3, width = def.width, enabled = def.enabled }
+        x = x + def.width + 1
+    end
+end
+
+local function drawLocationBar(w)
+    local label = "Location: "
+    gfx.drawText(1, 4, label, CHROME.barText, CHROME.barBg)
+    local fieldX = #label + 1
+    local fieldW = math.max(0, w - fieldX + 1)
+    local url = ("supervisor://%d/%s"):format(os.getComputerID(), currentTab:lower())
+    local text = " " .. url
+    if #text > fieldW then
+        text = text:sub(1, fieldW)
+    end
+    gfx.drawText(fieldX, 4, text .. string.rep(" ", math.max(0, fieldW - #text)), CHROME.locText, CHROME.locBg)
+end
+
+-- Persistent Netscape-style status bar, row h, shown on every tab regardless
+-- of currentTab (a real UX gain over the old design: an operator on the PLC
+-- or RTU tab used to have no visibility into overall SYSTEM status at all
+-- without switching back to SVR - now it's always in view). Flat CHROME.barBg
+-- with colored TEXT (not a colored band like drawSvrTab's own SYSTEM line
+-- uses) - deliberately more subdued, so it never visually competes with that
+-- banner on the one tab where both would otherwise be on screen together.
+local function drawStatusBar(w, h)
+    local status = aggregateStatus()
+    gfx.drawText(1, h, string.rep(" ", w), CHROME.barText, CHROME.barBg)
+    gfx.drawText(2, h, ("SYSTEM: %s"):format(status), STATUS_COLOR[status] or CHROME.barText, nil)
+    local right = "FCS-10 SUPERVISOR"
+    local rightX = w - #right
+    if rightX > 20 then
+        gfx.drawText(rightX, h, right, CHROME.barDim, nil)
     end
 end
 
@@ -830,28 +951,30 @@ local function drawSvrTab(w)
         end
     end
 
+    -- Rows start at 5, not 3: rows 1-4 are now the title/menu/toolbar/
+    -- location chrome (see drawConsoleScreen) rather than title+tab-strip.
     local status = aggregateStatus()
     local headerLine = (" SYSTEM: %s  (%d PLC%s, %d offline) "):format(
         status, plcCount, plcCount == 1 and "" or "s", offlineCount)
     headerLine = headerLine .. string.rep(" ", math.max(0, w - #headerLine))
-    gfx.drawText(1, 3, headerLine, colors.black, STATUS_COLOR[status] or colors.gray)
+    gfx.drawText(1, 5, headerLine, colors.black, STATUS_COLOR[status] or colors.gray)
 
-    gfx.drawText(1, 4, ("HB TX: %s ago (%ds cadence)"):format(
-        fmtAge(os.epoch("utc") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S), os_shell.THEME.text, os_shell.THEME.bg)
+    gfx.drawText(1, 6, ("HB TX: %s ago (%ds cadence)"):format(
+        fmtAge(os.epoch("utc") - lastHeartbeatSentAt), NET.HEARTBEAT_INTERVAL_S), CHROME.contentText, CHROME.contentBg)
 
     -- Surfaces secnetOpen (tracked for tryOpenSecnet's retry logic - see
     -- module state above) directly to the operator: a Supervisor stuck
     -- unable to open its own modem is the single worst failure mode in
     -- this whole project (every PLC fail-safe SCRAMs once it can't hear a
     -- heartbeat), so it deserves to be visible here, not just in the log.
-    gfx.drawText(1, 5, "MODEM: ", os_shell.THEME.text, os_shell.THEME.bg)
+    gfx.drawText(1, 7, "MODEM: ", CHROME.contentText, CHROME.contentBg)
     if secnetOpen then
-        gfx.drawText(8, 5, "OPEN", colors.green, os_shell.THEME.bg)
+        gfx.drawText(8, 7, "OPEN", colors.green, CHROME.contentBg)
     else
-        gfx.drawText(8, 5, "NOT OPEN (retrying)", colors.red, os_shell.THEME.bg)
+        gfx.drawText(8, 7, "NOT OPEN (retrying)", colors.red, CHROME.contentBg)
     end
 
-    gfx.drawText(1, 6, "CMD: " .. formatCommandStatus(lastCommandRef), os_shell.THEME.text, os_shell.THEME.bg)
+    gfx.drawText(1, 8, "CMD: " .. formatCommandStatus(lastCommandRef), CHROME.contentText, CHROME.contentBg)
 
     local scramLine
     if lastScramGlobal then
@@ -865,13 +988,13 @@ local function drawSvrTab(w)
     else
         scramLine = "LAST SCRAM: none yet"
     end
-    gfx.drawText(1, 7, scramLine, os_shell.THEME.text, os_shell.THEME.bg)
+    gfx.drawText(1, 9, scramLine, CHROME.contentText, CHROME.contentBg)
 
     if lotoCount > 0 then
-        gfx.drawText(1, 8, ("LOTO: %d reactor%s tagged"):format(lotoCount, lotoCount == 1 and "" or "s"),
-            colors.red, os_shell.THEME.bg)
+        gfx.drawText(1, 10, ("LOTO: %d reactor%s tagged"):format(lotoCount, lotoCount == 1 and "" or "s"),
+            colors.red, CHROME.contentBg)
     else
-        gfx.drawText(1, 8, "LOTO: none active", os_shell.THEME.text, os_shell.THEME.bg)
+        gfx.drawText(1, 10, "LOTO: none active", CHROME.contentText, CHROME.contentBg)
     end
 end
 
@@ -894,17 +1017,41 @@ local function drawRoleTab(h, predicate, showButtons)
     end
     lastRenderedButtons = buttons
 
-    local tableTop = 3
+    -- Starts at 5, not 3: rows 1-4 are now the title/menu/toolbar/location
+    -- chrome (see drawConsoleScreen) rather than title+tab-strip. `h` here
+    -- is already h-1 as passed by drawConsoleScreen (row h itself is
+    -- reserved for the persistent status bar - see drawStatusBar), so every
+    -- other use of `h` below (button row, reserved-space math) needs no
+    -- change of its own.
+    local tableTop = 5
     if h < tableTop then
         lastRenderedRows = {}
         lastRenderedTableTop = nil
         return -- terminal too short to show the table at all
     end
-    -- "ID  " (4 chars, matches "#%-3d") + 2 glyph columns (LOTO "L", Testing
-    -- "T", 1 char each) + "STATE" (10 chars, matches "%-10s") = 16 chars
-    -- before EAL, matching the per-row writes below exactly.
-    gfx.drawText(1, tableTop, "ID    STATE     EAL  DMG%   T-K   CLT%  WST%  BURN  AGE",
-        os_shell.THEME.text, os_shell.THEME.bg)
+    -- Column budget is deliberately tight: ID(4)+LOTO(1)+TEST(1)+STATE(9)+
+    -- EAL(5)+DMG(6)+T-K(5)+CLT(6)+WST(6)+BURN(4)+AGE(4) = 51 columns exactly,
+    -- fitting a standard 51-wide Advanced Computer with AGE still visible.
+    -- The ORIGINAL 55-char row (ID 4 + LOTO/TEST 2 + STATE 10 + EAL 5 + DMG/
+    -- T-K 7 each + CLT/WST 6 each + BURN 5 = 55) silently clipped AGE (and
+    -- most of BURN) off the right edge on this hardware the whole time -
+    -- this rewrite is the first time that got noticed, since gfx.drawText's
+    -- per-call explicit columns (no persistent cursor - see the per-row loop
+    -- below) forced writing the column math out instead of leaving it
+    -- implicit in a chain of term.write calls that just happened to run off
+    -- the edge unnoticed. STATE shrunk 10->9 (still fits every value used -
+    -- "CLD-START"/"HOT-STDBY" are the longest at 9, see
+    -- OPERATING_MODE_ABBR/config.STATES - no truncation). T-K shrunk to 4
+    -- digits (fits temps up to 9999K). DMG/CLT/WST all use %5.1f uniformly
+    -- now, not the original's mix of %4.1f/%5.1f: a value AT exactly 100.0
+    -- needs the full 5 characters regardless (Lua's string.format width is
+    -- a MINIMUM, never a truncation), so the original %4.1f fields were
+    -- already silently overflowing by 1 column whenever coolant/waste hit
+    -- exactly 100.0% or 0.0% padding edge - not a new behavior, just made
+    -- uniform and correct here. AGE shows "OFFL" instead of "OFFLINE" to
+    -- fit its 4-column budget.
+    gfx.drawText(1, tableTop, "ID  STATE   EAL  DMG%  T-K  CLT% WST% BURN AGE",
+        CHROME.contentText, CHROME.contentBg)
 
     -- Sort worst-first so that on a truncated screen the rows most worth an
     -- operator's attention are always the ones still visible.
@@ -963,7 +1110,7 @@ local function drawRoleTab(h, predicate, showButtons)
         if plcId == selectedPlcId then
             gfx.drawText(1, row, idText, colors.black, colors.white)
         else
-            gfx.drawText(1, row, idText, online and os_shell.THEME.text or colors.orange, os_shell.THEME.bg)
+            gfx.drawText(1, row, idText, online and CHROME.contentText or colors.orange, CHROME.contentBg)
         end
 
         -- LOTO / Testing indicators: small filled status LEDs (real pixels
@@ -977,12 +1124,12 @@ local function drawRoleTab(h, predicate, showButtons)
         if rec.loto then
             gfx.drawStatusLed(5, row, colors.red, "L")
         else
-            gfx.drawText(5, row, " ", os_shell.THEME.text, os_shell.THEME.bg)
+            gfx.drawText(5, row, " ", CHROME.contentText, CHROME.contentBg)
         end
         if rec.testingMode then
             gfx.drawStatusLed(6, row, colors.yellow, "T")
         else
-            gfx.drawText(6, row, " ", os_shell.THEME.text, os_shell.THEME.bg)
+            gfx.drawText(6, row, " ", CHROME.contentText, CHROME.contentBg)
         end
 
         local stateColor
@@ -991,17 +1138,17 @@ local function drawRoleTab(h, predicate, showButtons)
         elseif s.plantState == STATES.ANOMALY then
             stateColor = colors.orange
         else
-            stateColor = online and os_shell.THEME.text or colors.orange
+            stateColor = online and CHROME.contentText or colors.orange
         end
         local stateText = s.plantState
         if s.plantState == STATES.NORMAL and rec.operatingMode then
             stateText = OPERATING_MODE_ABBR[rec.operatingMode] or s.plantState
         end
-        gfx.drawText(7, row, string.format("%-10s", tostring(stateText or "?")), stateColor, os_shell.THEME.bg)
+        gfx.drawText(7, row, string.format("%-9s", tostring(stateText or "?")), stateColor, CHROME.contentBg)
 
         local ealColor = rec.activeEAL and TIER_BY_ID[rec.activeEAL] and colors[TIER_BY_ID[rec.activeEAL].color]
-        gfx.drawText(17, row, string.format("%-5s", rec.activeEAL or "--"),
-            ealColor or (online and os_shell.THEME.text or colors.orange), os_shell.THEME.bg)
+        gfx.drawText(16, row, string.format("%-5s", rec.activeEAL or "--"),
+            ealColor or (online and CHROME.contentText or colors.orange), CHROME.contentBg)
 
         -- Each metric: the exact numeric value (gfx.drawText) plus a real
         -- pixel trend arrow (gfx.drawTrendArrow - falls back to the
@@ -1013,66 +1160,78 @@ local function drawRoleTab(h, predicate, showButtons)
         -- blank cell instead of calling gfx.drawTrendArrow with a bogus
         -- direction - preserves the original blank-not-dash behavior for a
         -- PLC's very first reading.
-        local dataColor = online and os_shell.THEME.text or colors.orange
+        local dataColor = online and CHROME.contentText or colors.orange
 
         local function metric(col, numFmt, value, prevValue, eps)
             local numText = numFmt:format(value or 0)
-            gfx.drawText(col, row, numText, dataColor, os_shell.THEME.bg)
+            gfx.drawText(col, row, numText, dataColor, CHROME.contentBg)
             local dir = trendDirection(prevValue, value, eps)
             local arrowCol = col + #numText
             if dir then
                 gfx.drawTrendArrow(arrowCol, row, dir, dataColor)
             else
-                gfx.drawText(arrowCol, row, " ", dataColor, os_shell.THEME.bg)
+                gfx.drawText(arrowCol, row, " ", dataColor, CHROME.contentBg)
             end
         end
 
-        metric(22, "%5.1f", s.damagePct, prev and prev.damagePct, TREND_EPS.damagePct)
-        metric(29, "%5.0f", s.coreTempK, prev and prev.coreTempK, TREND_EPS.coreTempK)
-        metric(36, "%4.1f", s.coolantPct, prev and prev.coolantPct, TREND_EPS.coolantPct)
-        metric(42, "%4.1f", s.wastePct, prev and prev.wastePct, TREND_EPS.wastePct)
+        metric(21, "%5.1f", s.damagePct, prev and prev.damagePct, TREND_EPS.damagePct)
+        metric(27, "%4.0f", s.coreTempK, prev and prev.coreTempK, TREND_EPS.coreTempK)
+        metric(32, "%5.1f", s.coolantPct, prev and prev.coolantPct, TREND_EPS.coolantPct)
+        metric(38, "%5.1f", s.wastePct, prev and prev.wastePct, TREND_EPS.wastePct)
 
-        gfx.drawText(48, row, string.format("%4.0f ", s.burnRateMbT or 0), dataColor, os_shell.THEME.bg)
+        gfx.drawText(44, row, string.format("%4.0f", s.burnRateMbT or 0), dataColor, CHROME.contentBg)
 
         if online then
-            gfx.drawText(53, row, fmtAge(os.epoch("utc") - rec.lastTelemetryTs), dataColor, os_shell.THEME.bg)
+            gfx.drawText(48, row, fmtAge(os.epoch("utc") - rec.lastTelemetryTs), dataColor, CHROME.contentBg)
         else
-            gfx.drawText(53, row, "OFFLINE", colors.orange, os_shell.THEME.bg)
+            gfx.drawText(48, row, "OFFL", colors.orange, CHROME.contentBg)
         end
     end
 
     if #rows > shown then
         gfx.drawText(1, tableTop + shown + 1, ("+%d more (all lower severity)"):format(#rows - shown),
-            colors.gray, os_shell.THEME.bg)
+            colors.gray, CHROME.contentBg)
     end
 end
 
 -- The pre-existing SVR/PLC/RTU tabbed view, now one of four top-level
 -- screens (see "DESKTOP SHELL" below) rather than the only thing this file
--- ever draws. Drawn ENTIRELY through gfx.drawText/gfx.drawTrendArrow/
--- gfx.drawStatusLed (real pixels via CC:Graphics when available, plain text
--- otherwise), never a bare term.write - same reasoning as nodes/plc.lua's/
--- nodes/rtu.lua's SCADA screens: CC:Graphics' graphics mode is a confirmed
--- whole-screen toggle, so a screen that wants real trend arrows has to draw
--- literally everything else on it (tab bar, header, every table cell) as
--- pixels too, or graphics mode blanks the rest. gfx.beginFrame() here is
--- what actually turns that on when CC:Graphics is present; every gfx.* call
--- below still silently falls back to today's plain text otherwise.
+-- ever draws - reskinned as a retro browser window (see the CHROME palette
+-- and the title/menu/toolbar/location-bar section above for the full
+-- reasoning). Drawn ENTIRELY through gfx.drawText/gfx.drawBevel/
+-- gfx.drawTrendArrow/gfx.drawStatusLed (real pixels via CC:Graphics when
+-- available, plain text otherwise), never a bare term.write - same
+-- reasoning as nodes/plc.lua's/nodes/rtu.lua's SCADA screens: CC:Graphics'
+-- graphics mode is a confirmed whole-screen toggle, so a screen that wants
+-- real trend arrows/bevels has to draw literally everything else on it
+-- (chrome, header, every table cell) as pixels too, or graphics mode blanks
+-- the rest. gfx.beginFrame() here is what actually turns that on when
+-- CC:Graphics is present; every gfx.* call below still silently falls back
+-- to today's plain text otherwise.
+--
+-- Row layout: 1=title bar, 2=menu bar, 3=toolbar, 4=location bar, 5..h-1=
+-- content (SVR summary or PLC/RTU table - see drawSvrTab/drawRoleTab),
+-- h=persistent status bar. drawRoleTab is handed `h - 1`, not `h`, so its
+-- own button-row/reserved-space math (unchanged otherwise) naturally leaves
+-- the true last row exclusively to drawStatusBar below.
 local function drawConsoleScreen(w, h)
     gfx.beginFrame()
-    gfx.clear(os_shell.THEME.bg)
+    gfx.clear(CHROME.contentBg)
 
-    gfx.drawText(1, 1, ("FCS-10 SUPERVISOR #%d"):format(os.getComputerID()), os_shell.THEME.text, os_shell.THEME.bg)
-
-    drawTabBar(w)
+    drawTitleBar(w)
+    drawMenuBar(w)
+    drawToolbar(w)
+    drawLocationBar(w)
 
     if currentTab == "PLC" then
-        drawRoleTab(h, function(rec) return rec.role ~= "RTU" end, true)
+        drawRoleTab(h - 1, function(rec) return rec.role ~= "RTU" end, true)
     elseif currentTab == "RTU" then
-        drawRoleTab(h, function(rec) return rec.role == "RTU" end, false)
+        drawRoleTab(h - 1, function(rec) return rec.role == "RTU" end, false)
     else
         drawSvrTab(w)
     end
+
+    drawStatusBar(w, h)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1369,34 +1528,40 @@ local function main()
                             currentScreen = key
                         end
                     elseif currentScreen == "console" then
-                        local tabBtn = hitTestButtons(lastRenderedTabs, x, y)
-                        if tabBtn then
-                            if tabBtn.id == "__HOME__" then
-                                currentScreen = "desktop"
-                            else
-                                -- Selection is cleared on tab switch rather
-                                -- than carried across: a stale selectedPlcId
-                                -- pointing at a row from the tab just left
-                                -- (or one that isn't even shown on the new
-                                -- tab) is more confusing than just asking
-                                -- the operator to reselect.
-                                currentTab = tabBtn.id
-                                selectedPlcId = nil
-                            end
+                        if lastRenderedCloseBox and os_shell.isPointIn(
+                            { x = lastRenderedCloseBox.x, y = lastRenderedCloseBox.y, w = lastRenderedCloseBox.width, h = 1 }, x, y) then
+                            currentScreen = "desktop"
                         else
-                            local btn = hitTestButtons(lastRenderedButtons, x, y)
-                            if btn then
-                                if selectedPlcId then
-                                    if btn.id == "scram" then
-                                        sendScramCommand(selectedPlcId)
-                                    elseif btn.id == "open_bypass" then
-                                        sendOpenBypassCommand(selectedPlcId)
-                                    elseif btn.id == "close_bypass" then
-                                        sendCloseBypassCommand(selectedPlcId)
-                                    end
+                            local toolBtn = hitTestButtons(lastRenderedToolbar, x, y)
+                            if toolBtn and toolBtn.enabled then
+                                if toolBtn.id == "back" then
+                                    cycleTab(-1)
+                                elseif toolBtn.id == "forward" then
+                                    cycleTab(1)
+                                elseif toolBtn.id == "home" then
+                                    currentTab = "SVR"
+                                    selectedPlcId = nil
                                 end
-                            elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
-                                selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
+                                -- "reload"/others: no state change - the
+                                -- unconditional safeRedraw() below is the
+                                -- entire effect, honestly (see drawToolbar's
+                                -- header comment on why that's real, not a
+                                -- fake no-op).
+                            else
+                                local btn = hitTestButtons(lastRenderedButtons, x, y)
+                                if btn then
+                                    if selectedPlcId then
+                                        if btn.id == "scram" then
+                                            sendScramCommand(selectedPlcId)
+                                        elseif btn.id == "open_bypass" then
+                                            sendOpenBypassCommand(selectedPlcId)
+                                        elseif btn.id == "close_bypass" then
+                                            sendCloseBypassCommand(selectedPlcId)
+                                        end
+                                    end
+                                elseif lastRenderedTableTop and y > lastRenderedTableTop and y <= lastRenderedTableTop + #lastRenderedRows then
+                                    selectedPlcId = lastRenderedRows[y - lastRenderedTableTop]
+                                end
                             end
                         end
                     elseif currentScreen == "settings" and os_shell.isPointIn(themeButtonRegion, x, y) then
