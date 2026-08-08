@@ -60,6 +60,24 @@ local function available()
 end
 gfx.available = available
 
+-- Diagnostic-only, not used by any drawing function above - reports which
+-- specific named functions are/aren't present on `term` right now, so a
+-- Network screen (or anywhere else) can show exactly what's missing rather
+-- than a single opaque yes/no. Useful precisely because this module's own
+-- header notes CC:Graphics' own docs were never found - this is the
+-- cheapest way to see what a live install actually exposes.
+function gfx.diagnose()
+    return {
+        available        = available(),
+        setGraphicsMode  = type(term.setGraphicsMode) == "function",
+        getGraphicsMode  = type(term.getGraphicsMode) == "function",
+        setPixel         = type(term.setPixel) == "function",
+        drawPixels       = type(term.drawPixels) == "function",
+        getPixels        = type(term.getPixels) == "function",
+        setFrozen        = type(term.setFrozen) == "function",
+    }
+end
+
 -- Pixel-grid ratio - per CraftOS-PC's docs, graphics mode is exactly 6x the
 -- text terminal's width and 9x its height, in pixels. UNVERIFIED for
 -- CC:Graphics specifically - see header.

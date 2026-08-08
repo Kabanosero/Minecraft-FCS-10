@@ -422,7 +422,11 @@ local function drawNetworkScreen()
     homeHitRegion = os_shell.drawScreenHeader("NETWORK")
     local ageText = reactorState.lastUpdate > 0
         and fmtAge(os.epoch("utc") - reactorState.lastUpdate) or "--"
-    os_shell.drawKeyValueList({
+    -- CC:Graphics diagnostic - see lib/gfx.lua's diagnose(): reports which
+    -- specific named functions are/aren't present on `term` right now, not
+    -- just a single available/not-available bit, since this integration is
+    -- still unverified against CC:Graphics' own docs (none could be found).
+    local diagRows = {
         { label = "secnet",         value = secnetOpen and "OPEN" or "NOT OPEN",
           color = secnetOpen and colors.green or colors.red },
         { label = "Hosts on",       value = NET.PROTOCOL_PLC },
@@ -430,7 +434,19 @@ local function drawNetworkScreen()
         { label = "Last reading age", value = ageText },
         { label = "Heartbeat every",  value = NET.HEARTBEAT_INTERVAL_S .. "s" },
         { label = "Watchdog timeout", value = NET.HEARTBEAT_TIMEOUT_S .. "s" },
-    }, 3)
+    }
+    if gfx then
+        local d = gfx.diagnose()
+        diagRows[#diagRows + 1] = { label = "CC:Graphics", value = d.available and "AVAILABLE" or "NOT AVAILABLE",
+            color = d.available and colors.green or colors.red }
+        diagRows[#diagRows + 1] = { label = "  setGraphicsMode", value = tostring(d.setGraphicsMode) }
+        diagRows[#diagRows + 1] = { label = "  setPixel",        value = tostring(d.setPixel) }
+        diagRows[#diagRows + 1] = { label = "  drawPixels",      value = tostring(d.drawPixels) }
+        diagRows[#diagRows + 1] = { label = "  setFrozen",       value = tostring(d.setFrozen) }
+    else
+        diagRows[#diagRows + 1] = { label = "CC:Graphics", value = "lib/gfx.lua failed to load", color = colors.red }
+    end
+    os_shell.drawKeyValueList(diagRows, 3)
     local _, h = term.getSize()
     os_shell.drawScreenFrame(1, h)
 end

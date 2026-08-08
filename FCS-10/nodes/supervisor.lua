@@ -1061,24 +1061,44 @@ end
 
 local function drawNetworkScreen()
     homeHitRegion = os_shell.drawScreenHeader("NETWORK")
-    os_shell.drawKeyValueList({
+
+    -- CC:Graphics diagnostic - see lib/gfx.lua's diagnose(): reports which
+    -- specific named functions are/aren't present on `term` right now, not
+    -- just a single available/not-available bit, since this integration is
+    -- still unverified against CC:Graphics' own docs (none could be found).
+    local diagRows = {
         { label = "secnet",     value = secnetOpen and "OPEN" or "NOT OPEN",
           color = secnetOpen and colors.green or colors.red },
         { label = "Hosts on",   value = NET.PROTOCOL_SUPERVISOR },
         { label = "Sends to",   value = NET.PROTOCOL_PLC },
         { label = "HB sent",    value = fmtAge(os.epoch("utc") - lastHeartbeatSentAt) .. " ago" },
         { label = "HB cadence", value = NET.HEARTBEAT_INTERVAL_S .. "s" },
-    }, 3)
+    }
+    if gfx then
+        local d = gfx.diagnose()
+        diagRows[#diagRows + 1] = { label = "CC:Graphics", value = d.available and "AVAILABLE" or "NOT AVAILABLE",
+            color = d.available and colors.green or colors.red }
+        diagRows[#diagRows + 1] = { label = "  setGraphicsMode", value = tostring(d.setGraphicsMode) }
+        diagRows[#diagRows + 1] = { label = "  setPixel",        value = tostring(d.setPixel) }
+        diagRows[#diagRows + 1] = { label = "  drawPixels",      value = tostring(d.drawPixels) }
+        diagRows[#diagRows + 1] = { label = "  setFrozen",       value = tostring(d.setFrozen) }
+    else
+        diagRows[#diagRows + 1] = { label = "CC:Graphics", value = "lib/gfx.lua failed to load", color = colors.red }
+    end
+    local nextRow = os_shell.drawKeyValueList(diagRows, 3)
 
     -- Peer list - unlike plc.lua/rtu.lua's Network screens, this node
     -- actually tracks one (the `plcs` table), so it's worth showing here.
     -- Bounded to h - 1, not h: row h is reserved for drawScreenFrame()'s
     -- own closing border below, so a full peer list can never collide with
     -- it (an entry silently overwritten by the border would be worse than
-    -- just not showing it).
+    -- just not showing it). Starts right after the diagnostic rows above
+    -- (via drawKeyValueList's own returned next-free-row) rather than a
+    -- hardcoded row number, so the two blocks can never collide even as the
+    -- diagnostic list above grows/shrinks.
     local _, h = term.getSize()
     local lastRow = h - 1
-    local row = 10
+    local row = nextRow + 1
     if row <= lastRow then
         term.setTextColor(colors.gray)
         term.setCursorPos(2, row)
